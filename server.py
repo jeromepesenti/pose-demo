@@ -40,6 +40,7 @@ MODES = {
     "objects":       {"label": "Object Detection",               "group": "MediaPipe"},
     "rtmpose_body":  {"label": "RTMPose Body",                   "group": "RTMPose (MMPose)"},
     "rtmpose_whole": {"label": "RTMPose Wholebody (133 pts)",    "group": "RTMPose (MMPose)"},
+    "rtmpose_shadow":{"label": "RTMPose Body Shadow",            "group": "RTMPose (MMPose)"},
 }
 
 # ── Connection definitions ───────────────────────────────────────────
@@ -250,6 +251,10 @@ HTML = """
       <img src="https://i.ytimg.com/vi/r2jd613Rdhs/mqdefault.jpg" alt="iDancers">
       <div class="card-title">iDancers - Beautiful Girls Dancing</div>
     </div>
+    <div class="video-card" onclick="pickVideo('https://www.youtube.com/watch?v=2DiQUX11YaY', this)">
+      <img src="https://i.ytimg.com/vi/2DiQUX11YaY/mqdefault.jpg" alt="Flashmob">
+      <div class="card-title">Crazy Uptown Funk Flashmob in Sydney</div>
+    </div>
   </div>
 
   <!-- Main content -->
@@ -275,6 +280,7 @@ HTML = """
         <optgroup label="RTMPose (MMPose)">
           <option value="rtmpose_body">RTMPose Body</option>
           <option value="rtmpose_whole">RTMPose Wholebody (133 pts)</option>
+          <option value="rtmpose_shadow">RTMPose Body Shadow</option>
         </optgroup>
       </select>
     </div>
@@ -606,6 +612,117 @@ def _create_processor(mode):
         return Body(mode='lightweight', to_openpose=True, backend='onnxruntime')
     elif mode == "rtmpose_whole":
         return Wholebody(mode='lightweight', to_openpose=False, backend='onnxruntime')
+    elif mode == "rtmpose_shadow":
+        return Body(mode='lightweight', to_openpose=True, backend='onnxruntime')
+
+
+# ── Body shadow drawing ─────────────────────────────────────────────
+
+# OpenPose COCO-18 keypoint indices
+_OP = {
+    "nose": 0, "neck": 1,
+    "r_sho": 2, "r_elb": 3, "r_wri": 4,
+    "l_sho": 5, "l_elb": 6, "l_wri": 7,
+    "r_hip": 8, "r_kne": 9, "r_ank": 10,
+    "l_hip": 11, "l_kne": 12, "l_ank": 13,
+    "r_eye": 14, "l_eye": 15, "r_ear": 16, "l_ear": 17,
+}
+
+def _pt(keypoints, scores, name, threshold=0.3):
+    """Get (x, y) for a keypoint, or None if below threshold."""
+    idx = _OP[name]
+    if idx < len(scores) and scores[idx] > threshold:
+        return (int(keypoints[idx][0]), int(keypoints[idx][1]))
+    return None
+
+def _midpoint(a, b):
+    if a is None or b is None:
+        return None
+    return ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
+
+def _limb_polygon(p1, p2, width):
+    """Create a thick polygon (rectangle) between two points."""
+    if p1 is None or p2 is None:
+        return None
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    length = max(1, (dx*dx + dy*dy) ** 0.5)
+    nx = -dy / length * width / 2
+    ny = dx / length * width / 2
+    return np.array([
+        [int(p1[0] + nx), int(p1[1] + ny)],
+        [int(p1[0] - nx), int(p1[1] - ny)],
+        [int(p2[0] - nx), int(p2[1] - ny)],
+        [int(p2[0] + nx), int(p2[1] + ny)],
+    ], dtype=np.int32)
+
+def draw_body_shadow(frame, keypoints, scores, color=(40, 30, 30)):
+    """Draw a filled body silhouette from OpenPose keypoints."""
+    kp, sc = keypoints, scores
+    p = lambda name: _pt(kp, sc, name)
+
+    nose = p("nose")
+    neck = p("neck")
+    r_sho = p("r_sho"); l_sho = p("l_sho")
+    r_elb = p("r_elb"); l_elb = p("l_elb")
+    r_wri = p("r_wri"); l_wri = p("l_wri")
+    r_hip = p("r_hip"); l_hip = p("l_hip")
+    r_kne = p("r_kne"); l_kne = p("l_kne")
+    r_ank = p("r_ank"); l_ank = p("l_ank")
+
+    # Estimate body scale from shoulder width or torso height
+    body_scale = 30  # default
+    if r_sho and l_sho:
+        body_scale = max(20, int(((r_sho[0]-l_sho[0])**2 + (r_sho[1]-l_sho[1])**2)**0.5 * 0.4))
+
+    # Head: circle at nose or midpoint of eyes
+    head_center = nose or _midpoint(p("r_eye"), p("l_eye"))
+    if head_center:
+        head_r = max(12, int(body_scale * 0.7))
+        cv2.circle(frame, head_center, head_r, color, -1)
+
+    # Neck to head connection
+    if neck and head_center:
+        poly = _limb_polygon(neck, head_center, int(body_scale * 0.5))
+        if poly is not None:
+            cv2.fillPoly(frame, [poly], color)
+
+    # Torso: polygon from shoulders to hips
+    torso_pts = [pt for pt in [r_sho, l_sho, l_hip, r_hip] if pt is not None]
+    if len(torso_pts) >= 3:
+        cv2.fillPoly(frame, [np.array(torso_pts, dtype=np.int32)], color)
+
+    # Upper body fill: neck area
+    if neck and r_sho and l_sho:
+        cv2.fillPoly(frame, [np.array([neck, r_sho, l_sho], dtype=np.int32)], color)
+
+    # Limbs as thick polygons
+    limb_w = max(10, int(body_scale * 0.45))
+    arm_w = max(8, int(body_scale * 0.35))
+    calf_w = max(8, int(body_scale * 0.35))
+
+    limbs = [
+        (r_sho, r_elb, arm_w), (r_elb, r_wri, arm_w),
+        (l_sho, l_elb, arm_w), (l_elb, l_wri, arm_w),
+        (r_hip, r_kne, limb_w), (r_kne, r_ank, calf_w),
+        (l_hip, l_kne, limb_w), (l_kne, l_ank, calf_w),
+    ]
+    for a, b, w in limbs:
+        poly = _limb_polygon(a, b, w)
+        if poly is not None:
+            cv2.fillPoly(frame, [poly], color)
+
+    # Joint circles for smoother connections
+    joint_r = max(5, int(body_scale * 0.22))
+    for pt in [neck, r_sho, l_sho, r_elb, l_elb, r_hip, l_hip, r_kne, l_kne]:
+        if pt:
+            cv2.circle(frame, pt, joint_r, color, -1)
+
+    # Hands and feet (smaller circles)
+    extremity_r = max(4, int(body_scale * 0.18))
+    for pt in [r_wri, l_wri, r_ank, l_ank]:
+        if pt:
+            cv2.circle(frame, pt, extremity_r, color, -1)
 
 
 # ── Frame processing ─────────────────────────────────────────────────
@@ -707,6 +824,16 @@ def process_frame(mode, processor, frame, mp_image):
                 draw_keypoints_array(out, kp, sc,
                                      RTMPOSE_WHOLEBODY_LHAND + RTMPOSE_WHOLEBODY_RHAND,
                                      (80, 227, 194), threshold=0.3, thickness=2, radius=3)
+        return out
+
+    elif mode == "rtmpose_shadow":
+        h, w = frame.shape[:2]
+        out = np.full((h, w, 3), (220, 220, 230), dtype=np.uint8)
+        keypoints, scores = processor(frame)
+        if keypoints is not None and len(keypoints) > 0:
+            for i in range(len(keypoints)):
+                draw_body_shadow(out, keypoints[i], scores[i], color=(40, 30, 30))
+            out = cv2.GaussianBlur(out, (5, 5), 0)
         return out
 
     return frame.copy()
