@@ -1,0 +1,17 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Downloaded videos
+downloads/
+
+# Model files (too large for git — downloaded at runtime)
+*.task
+*.tflite
+*.caffemodel
+*.prototxt
+*.onnx
+
+# OS
+.DS_Store

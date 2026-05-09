@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pose Estimation + Shadow</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e;
+    color: #eee;
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+  }
+  h1 { margin: 20px 0 10px; font-size: 1.4rem; }
+  #info { font-size: 0.85rem; color: #aaa; margin-bottom: 12px; }
+  #panels {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .panel { position: relative; display: inline-block; }
+  .panel-label { text-align: center; font-size: 0.8rem; color: #aaa; margin-bottom: 6px; }
+  video { display: block; border-radius: 8px; }
+  canvas { border-radius: 8px; }
+  #pose-canvas { position: absolute; top: 22px; left: 0; }
+  #fps {
+    position: absolute; top: 28px; left: 6px;
+    background: rgba(0,0,0,0.6); padding: 4px 10px;
+    border-radius: 4px; font-size: 0.85rem; z-index: 10;
+  }
+  #start-btn {
+    margin: 20px; padding: 12px 32px; font-size: 1rem;
+    border: none; border-radius: 6px; background: #e94560; color: #fff; cursor: pointer;
+  }
+  #start-btn:hover { background: #c73650; }
+  #start-btn:disabled { background: #555; cursor: wait; }
+  #status { margin: 10px; font-size: 0.9rem; color: #aaa; }
+</style>
+</head>
+<body>
+
+<h1>Pose Estimation + Shadow Silhouette</h1>
+<div id="info">Powered by MediaPipe Vision</div>
+
+<button id="start-btn">Start Camera</button>
+<div id="status"></div>
+
+<div id="panels" style="display:none;">
+  <div class="panel" id="left-panel">
+    <div class="panel-label">Pose Detection</div>
+    <video id="video" playsinline></video>
+    <canvas id="pose-canvas"></canvas>
+    <div id="fps"></div>
+  </div>
+  <div class="panel" id="right-panel">
+    <div class="panel-label">Shadow</div>
+    <canvas id="shadow-canvas"></canvas>
+  </div>
+</div>
+
+<script type="module">
+import {
+  PoseLandmarker,
+  ImageSegmenter,
+  FilesetResolver,
+  DrawingUtils
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18";
+
+const POSE_CONNECTIONS = PoseLandmarker.POSE_CONNECTIONS;
+
+const PERSON_COLORS = [
+  '#e94560','#0f3460','#16c79a','#f5a623',
+  '#bd10e0','#50e3c2','#ff6b6b','#4ecdc4'
+];
+
+const SHADOW_COLOR = [30, 30, 60];
+const BG_COLOR = [220, 220, 230];
+const MIN_CONFIDENCE = 0.3;
+
+const video = document.getElementById('video');
+const poseCanvas = document.getElementById('pose-canvas');
+const poseCtx = poseCanvas.getContext('2d');
+const shadowCanvas = document.getElementById('shadow-canvas');
+const shadowCtx = shadowCanvas.getContext('2d');
+const fpsEl = document.getElementById('fps');
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('start-btn');
+const panels = document.getElementById('panels');
+
+let poseLandmarker = null;
+let segmenter = null;
+let lastTime = performance.now();
+let frameCount = 0;
+
+startBtn.addEventListener('click', init);
+
+async function init() {
+  startBtn.disabled = true;
+  statusEl.textContent = 'Loading models...';
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    video.width = w; video.height = h;
+    poseCanvas.width = w; poseCanvas.height = h;
+    shadowCanvas.width = w; shadowCanvas.height = h;
+
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
+    );
+
+    statusEl.textContent = 'Loading pose model...';
+    poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numPoses: 6
+    });
+
+    statusEl.textContent = 'Loading segmentation model...';
+    segmenter = await ImageSegmenter.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      outputCategoryMask: true,
+      outputConfidenceMasks: false
+    });
+
+    startBtn.style.display = 'none';
+    statusEl.style.display = 'none';
+    panels.style.display = 'flex';
+
+    detect();
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+    console.error(err);
+    startBtn.disabled = false;
+  }
+}
+
+function detect() {
+  const now = performance.now();
+
+  // Pose
+  const poseResult = poseLandmarker.detectForVideo(video, now);
+  drawPose(poseResult);
+
+  // Segmentation
+  segmenter.segmentForVideo(video, now, (segResult) => {
+    if (segResult.categoryMask) {
+      drawShadow(segResult.categoryMask);
+    }
+  });
+
+  // FPS
+  frameCount++;
+  if (now - lastTime >= 500) {
+    const fps = (frameCount / ((now - lastTime) / 1000)).toFixed(1);
+    const count = poseResult.landmarks ? poseResult.landmarks.length : 0;
+    fpsEl.textContent = fps + ' FPS | ' + count + ' person(s)';
+    frameCount = 0;
+    lastTime = now;
+  }
+
+  requestAnimationFrame(detect);
+}
+
+function drawPose(result) {
+  poseCtx.clearRect(0, 0, poseCanvas.width, poseCanvas.height);
+  const w = poseCanvas.width;
+  const h = poseCanvas.height;
+
+  if (!result.landmarks) return;
+
+  result.landmarks.forEach((landmarks, i) => {
+    const color = PERSON_COLORS[i % PERSON_COLORS.length];
+
+    // Draw connections
+    poseCtx.lineWidth = 3;
+    poseCtx.strokeStyle = color;
+    for (const conn of POSE_CONNECTIONS) {
+      const a = landmarks[conn.start];
+      const b = landmarks[conn.end];
+      if (a.visibility > MIN_CONFIDENCE && b.visibility > MIN_CONFIDENCE) {
+        poseCtx.beginPath();
+        poseCtx.moveTo(a.x * w, a.y * h);
+        poseCtx.lineTo(b.x * w, b.y * h);
+        poseCtx.stroke();
+      }
+    }
+
+    // Draw keypoints
+    for (const lm of landmarks) {
+      if (lm.visibility > MIN_CONFIDENCE) {
+        poseCtx.beginPath();
+        poseCtx.arc(lm.x * w, lm.y * h, 4, 0, 2 * Math.PI);
+        poseCtx.fillStyle = color;
+        poseCtx.fill();
+        poseCtx.strokeStyle = '#fff';
+        poseCtx.lineWidth = 1.5;
+        poseCtx.stroke();
+      }
+    }
+  });
+}
+
+function drawShadow(mask) {
+  const w = shadowCanvas.width;
+  const h = shadowCanvas.height;
+  const maskData = mask.getAsUint8Array();
+  const imageData = shadowCtx.createImageData(w, h);
+  const data = imageData.data;
+
+  for (let i = 0; i < maskData.length; i++) {
+    const pi = i * 4;
+    if (maskData[i] > 0) {
+      data[pi]     = SHADOW_COLOR[0];
+      data[pi + 1] = SHADOW_COLOR[1];
+      data[pi + 2] = SHADOW_COLOR[2];
+    } else {
+      data[pi]     = BG_COLOR[0];
+      data[pi + 1] = BG_COLOR[1];
+      data[pi + 2] = BG_COLOR[2];
+    }
+    data[pi + 3] = 255;
+  }
+
+  shadowCtx.putImageData(imageData, 0, 0);
+}
+</script>
+</body>
+</html>

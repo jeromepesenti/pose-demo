@@ -1,0 +1,7 @@
+mediapipe>=0.10.35
+opencv-python>=4.8
+yt-dlp>=2024.0
+flask>=3.0
+rtmlib>=0.0.15
+onnxruntime>=1.16
+numpy
