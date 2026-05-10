@@ -26,6 +26,151 @@ YT_DLP = shutil.which("yt-dlp") or os.path.join(BASE_DIR, "venv", "bin", "yt-dlp
 # GPU backend URL — set via env var or default to localhost
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:5005")
 
+# Lambda Labs API for on-demand GPU
+LAMBDA_API_KEY = os.environ.get("LAMBDA_API_KEY", "")
+LAMBDA_SSH_KEY_ID = os.environ.get("LAMBDA_SSH_KEY_ID", "e1a91631ba094aff95d4f1971dfb06ef")
+LAMBDA_INSTANCE_TYPE = os.environ.get("LAMBDA_INSTANCE_TYPE", "gpu_1x_a100_sxm4")
+LAMBDA_REGION = os.environ.get("LAMBDA_REGION", "")  # auto-select if empty
+
+_lambda_state = {
+    "instance_id": None,
+    "ip": None,
+    "status": "off",       # off, starting, setup, ready, stopping
+    "last_activity": 0,
+    "idle_timeout": 900,   # 15 minutes
+}
+
+import threading as _threading
+
+def _lambda_api(method, endpoint, data=None):
+    headers = {"Authorization": f"Bearer {LAMBDA_API_KEY}"}
+    if method == "GET":
+        r = http_requests.get(f"https://cloud.lambdalabs.com/api/v1/{endpoint}", headers=headers, timeout=10)
+    else:
+        r = http_requests.post(f"https://cloud.lambdalabs.com/api/v1/{endpoint}", headers=headers, json=data, timeout=30)
+    return r.json()
+
+
+def _lambda_launch():
+    """Launch a Lambda instance and set up the backend."""
+    _lambda_state["status"] = "starting"
+
+    # Find available region
+    types = _lambda_api("GET", "instance-types")
+    instance_info = types.get("data", {}).get(LAMBDA_INSTANCE_TYPE, {})
+    regions = instance_info.get("regions_with_capacity_available", [])
+    if not regions:
+        _lambda_state["status"] = "off"
+        print(f"[Lambda] No capacity for {LAMBDA_INSTANCE_TYPE}")
+        return False
+
+    region = LAMBDA_REGION or regions[0]["name"]
+
+    # Launch
+    result = _lambda_api("POST", "instance-operations/launch", {
+        "region_name": region,
+        "instance_type_name": LAMBDA_INSTANCE_TYPE,
+        "ssh_key_names": [LAMBDA_SSH_KEY_ID],
+        "quantity": 1,
+    })
+    instance_ids = result.get("data", {}).get("instance_ids", [])
+    if not instance_ids:
+        _lambda_state["status"] = "off"
+        print(f"[Lambda] Launch failed: {result}")
+        return False
+
+    _lambda_state["instance_id"] = instance_ids[0]
+    print(f"[Lambda] Launched instance {instance_ids[0]}, waiting for IP...")
+
+    # Poll for IP
+    import time
+    for _ in range(60):
+        time.sleep(5)
+        info = _lambda_api("GET", f"instances/{_lambda_state['instance_id']}")
+        instance = info.get("data", {})
+        ip = instance.get("ip")
+        status = instance.get("status")
+        if ip and status == "active":
+            _lambda_state["ip"] = ip
+            break
+    else:
+        _lambda_state["status"] = "off"
+        print("[Lambda] Timed out waiting for instance")
+        return False
+
+    print(f"[Lambda] Instance ready at {ip}, setting up...")
+    _lambda_state["status"] = "setup"
+
+    # Setup: copy files and install
+    import subprocess
+    ip = _lambda_state["ip"]
+    base = os.path.dirname(os.path.abspath(__file__))
+
+    # Wait for SSH
+    for _ in range(12):
+        try:
+            subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                           f"ubuntu@{ip}", "echo ready"], capture_output=True, timeout=10)
+            break
+        except Exception:
+            time.sleep(5)
+
+    # Copy files
+    subprocess.run(["scp", "-o", "StrictHostKeyChecking=no",
+                    f"{base}/backend_gpu.py", f"{base}/controlnet_gpu.py",
+                    f"{base}/setup_lambda.sh",
+                    f"ubuntu@{ip}:~/pose-demo/"], capture_output=True, timeout=30)
+
+    # Run setup
+    subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
+                    "bash ~/pose-demo/setup_lambda.sh"], capture_output=True, timeout=300)
+
+    # Start backend
+    subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
+                    "cd ~/pose-demo && nohup python3 backend_gpu.py > backend.log 2>&1 &"],
+                   capture_output=True, timeout=10)
+    time.sleep(5)
+
+    # Connect frontend
+    global BACKEND_URL
+    BACKEND_URL = f"http://{ip}:5005"
+    _lambda_state["status"] = "ready"
+    _lambda_state["last_activity"] = time.time()
+    print(f"[Lambda] Backend ready at {BACKEND_URL}")
+    return True
+
+
+def _lambda_terminate():
+    """Terminate the Lambda instance."""
+    if not _lambda_state["instance_id"]:
+        return
+    _lambda_state["status"] = "stopping"
+    result = _lambda_api("POST", "instance-operations/terminate", {
+        "instance_ids": [_lambda_state["instance_id"]],
+    })
+    print(f"[Lambda] Terminated: {result}")
+    global BACKEND_URL
+    BACKEND_URL = "http://localhost:5005"
+    _lambda_state["instance_id"] = None
+    _lambda_state["ip"] = None
+    _lambda_state["status"] = "off"
+
+
+def _idle_monitor():
+    """Background thread: terminate Lambda instance after idle timeout."""
+    import time
+    while True:
+        time.sleep(30)
+        if (_lambda_state["status"] == "ready" and
+            _lambda_state["last_activity"] > 0 and
+            time.time() - _lambda_state["last_activity"] > _lambda_state["idle_timeout"]):
+            print(f"[Lambda] Idle for {_lambda_state['idle_timeout']}s, terminating...")
+            _lambda_terminate()
+
+if LAMBDA_API_KEY:
+    _idle_thread = _threading.Thread(target=_idle_monitor, daemon=True)
+    _idle_thread.start()
+
 current_video = {"path": None, "fps": 30, "duration": 0, "total_frames": 0}
 
 MAX_SAVED_VIDEOS = 10
@@ -229,6 +374,9 @@ def frame(mode):
     if not ret:
         return "Frame not found", 404
 
+    # Track activity for idle timeout
+    _lambda_state["last_activity"] = time.time()
+
     # Encode frame and send to GPU backend
     _, buf = cv2.imencode(".jpg", raw_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
@@ -330,6 +478,30 @@ def stream(mode):
 
 
 # ── Backend status ───────────────────────────────────────────────────
+
+@app.route("/gpu/status")
+def gpu_status():
+    return jsonify(_lambda_state)
+
+
+@app.route("/gpu/start", methods=["POST"])
+def gpu_start():
+    if not LAMBDA_API_KEY:
+        return jsonify({"error": "No LAMBDA_API_KEY configured"})
+    if _lambda_state["status"] not in ("off",):
+        return jsonify({"error": f"GPU is {_lambda_state['status']}"})
+    # Launch in background thread
+    _threading.Thread(target=_lambda_launch, daemon=True).start()
+    return jsonify({"ok": True, "status": "starting"})
+
+
+@app.route("/gpu/stop", methods=["POST"])
+def gpu_stop():
+    if not LAMBDA_API_KEY:
+        return jsonify({"error": "No LAMBDA_API_KEY configured"})
+    _lambda_terminate()
+    return jsonify({"ok": True, "status": "off"})
+
 
 @app.route("/set_backend", methods=["POST"])
 def set_backend():
