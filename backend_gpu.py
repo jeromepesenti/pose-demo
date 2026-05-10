@@ -241,6 +241,7 @@ def frame_endpoint(mode):
 
 
 _stream_stats = {"proc_ms": 0, "fps": 0, "t0": 0, "count": 0}
+_stream_generation = {"id": 0}  # incremented on each new stream to cancel old ones
 
 
 @app.route("/stream_stats")
@@ -250,16 +251,18 @@ def stream_stats_endpoint():
 
 @app.route("/stream/<mode>")
 def stream_endpoint(mode):
-    """MJPEG stream from loaded video."""
+    """MJPEG stream from loaded video. Cancels any previous stream."""
+    _stream_generation["id"] += 1
+    gen_id = _stream_generation["id"]
     start_time = float(request.args.get("t", 0))
     prompt = request.args.get("prompt", None)
     return Response(
-        _generate_stream(mode, start_time, prompt),
+        _generate_stream(mode, start_time, prompt, gen_id),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
 
 
-def _generate_stream(mode, start_time=0, prompt=None):
+def _generate_stream(mode, start_time=0, prompt=None, gen_id=None):
     path = _current_video.get("path")
     if not path or not os.path.exists(path):
         return
@@ -282,6 +285,10 @@ def _generate_stream(mode, start_time=0, prompt=None):
 
     try:
         while cap.isOpened():
+            # Stop if a newer stream has started
+            if gen_id is not None and _stream_generation["id"] != gen_id:
+                print(f"[Stream] Cancelled (gen {gen_id} replaced by {_stream_generation['id']})")
+                break
             t0 = time.time()
             ret, frame = cap.read()
             if not ret:
