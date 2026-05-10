@@ -273,6 +273,25 @@ def _sync_video_to_backend():
 
 # ── Frame processing (proxy to backend which has the video) ──────────
 
+@app.route("/sync_video", methods=["POST"])
+def sync_video():
+    """Explicitly sync the current video to the active backend."""
+    _backend_video_synced["path"] = None  # force re-sync
+    if _backend_available():
+        ok = _sync_video_to_backend()
+        return jsonify({"ok": ok})
+    # Also sync to CPU backend
+    path = current_video.get("path")
+    if path and os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                http_requests.post(f"{CPU_BACKEND_URL}/upload_video",
+                                   files={"video": ("video.mp4", f)}, timeout=120)
+        except Exception:
+            pass
+    return jsonify({"ok": True})
+
+
 @app.route("/frame/<mode>")
 def frame(mode):
     if not current_video.get("path"):

@@ -315,10 +315,14 @@ async function loadVideo(videoId, name, card) {
     const resp = await fetch('/load_video/' + videoId);
     const data = await resp.json();
     if (data.error) { statusEl.textContent = 'Error: ' + data.error; return; }
+
+    // Sync video to backend
+    statusEl.textContent = 'Syncing to backend...';
+    await fetch('/sync_video', { method: 'POST' });
+
     videoReady = true;
     output.style.display = 'block';
     getMode();
-    statusEl.textContent = 'Ready — press play';
     startStream();
   } catch (e) {
     statusEl.textContent = 'Error: ' + e.message;
@@ -337,10 +341,11 @@ async function uploadVideo(input) {
     const resp = await fetch('/upload_video', { method: 'POST', body: formData });
     const data = await resp.json();
     if (data.error) { statusEl.textContent = 'Error: ' + data.error; return; }
+    statusEl.textContent = 'Syncing to backend...';
+    await fetch('/sync_video', { method: 'POST' });
     videoReady = true;
     output.style.display = 'block';
     getMode();
-    statusEl.textContent = 'Ready — press play';
     loadVideoList();
     startStream();
   } catch (e) {
@@ -367,10 +372,11 @@ async function go() {
     });
     const data = await resp.json();
     if (data.error) { statusEl.textContent = 'Error: ' + data.error; btn.disabled = false; return; }
+    statusEl.textContent = 'Syncing to backend...';
+    await fetch('/sync_video', { method: 'POST' });
     videoReady = true;
     output.style.display = 'block';
     getMode();
-    statusEl.textContent = 'Ready — press play';
     loadVideoList();
     startStream();
   } catch (e) {
