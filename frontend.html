@@ -164,7 +164,7 @@
           <option value="d2_densepose">DensePose (body surface)</option>
         </optgroup>
         <optgroup label="Generative" id="gen-group" style="display:none;">
-          <option value="controlnet">ControlNet Pose (SD 1.5)</option>
+          <option value="controlnet">ControlNet + Diffusion</option>
           <option value="controlnet_video">AnimateDiff + ControlNet (video)</option>
         </optgroup>
         <optgroup label="MediaPipe">
@@ -180,7 +180,9 @@
 
     <div class="row" id="prompt-row" style="display:none;">
       <input id="prompt-input" type="text" placeholder="Describe the person..." value="person dancing, professional photo, studio lighting, high quality"
-        style="flex:1; padding:10px 14px; font-size:1rem; border:1px solid #333; border-radius:6px; background:#16213e; color:#eee; outline:none;">
+        style="flex:1; padding:10px 14px; font-size:1rem; border:1px solid #333; border-radius:6px; background:#16213e; color:#eee; outline:none;"
+        onkeydown="if(event.key==='Enter') applyPrompt()">
+      <button onclick="applyPrompt()" style="padding:10px 18px;">Apply</button>
     </div>
 
     <div class="row" id="ref-row" style="display:none;">
@@ -408,8 +410,13 @@ function togglePlay() {
 // ── Mode change: restart stream ──
 document.getElementById('mode-select').addEventListener('change', () => {
   getMode();
-  if (videoReady && playing) startStream();
+  if (videoReady) startStream();
 });
+
+// ── Prompt change: restart stream with new prompt ──
+function applyPrompt() {
+  if (videoReady) startStream();
+}
 
 // ── Modes from backend ──
 fetch('/modes').then(r => r.json()).then(modes => {
