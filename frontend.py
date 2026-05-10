@@ -28,7 +28,7 @@ BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:5005")
 
 # Lambda Labs API for on-demand GPU
 LAMBDA_API_KEY = os.environ.get("LAMBDA_API_KEY", "")
-LAMBDA_SSH_KEY_ID = os.environ.get("LAMBDA_SSH_KEY_ID", "e1a91631ba094aff95d4f1971dfb06ef")
+LAMBDA_SSH_KEY_NAME = os.environ.get("LAMBDA_SSH_KEY_NAME", "macbook")
 LAMBDA_INSTANCE_TYPE = os.environ.get("LAMBDA_INSTANCE_TYPE", "gpu_1x_a100_sxm4")
 LAMBDA_REGION = os.environ.get("LAMBDA_REGION", "")  # auto-select if empty
 
@@ -36,6 +36,7 @@ _lambda_state = {
     "instance_id": None,
     "ip": None,
     "status": "off",       # off, starting, setup, ready, stopping
+    "message": "",         # detailed status message
     "last_activity": 0,
     "idle_timeout": 900,   # 15 minutes
 }
@@ -53,94 +54,146 @@ def _lambda_api(method, endpoint, data=None):
 
 def _lambda_launch():
     """Launch a Lambda instance and set up the backend."""
-    _lambda_state["status"] = "starting"
-
-    # Find available region
-    types = _lambda_api("GET", "instance-types")
-    instance_info = types.get("data", {}).get(LAMBDA_INSTANCE_TYPE, {})
-    regions = instance_info.get("regions_with_capacity_available", [])
-    if not regions:
-        _lambda_state["status"] = "off"
-        print(f"[Lambda] No capacity for {LAMBDA_INSTANCE_TYPE}")
-        return False
-
-    region = LAMBDA_REGION or regions[0]["name"]
-
-    # Launch
-    result = _lambda_api("POST", "instance-operations/launch", {
-        "region_name": region,
-        "instance_type_name": LAMBDA_INSTANCE_TYPE,
-        "ssh_key_names": [LAMBDA_SSH_KEY_ID],
-        "quantity": 1,
-    })
-    instance_ids = result.get("data", {}).get("instance_ids", [])
-    if not instance_ids:
-        _lambda_state["status"] = "off"
-        print(f"[Lambda] Launch failed: {result}")
-        return False
-
-    _lambda_state["instance_id"] = instance_ids[0]
-    print(f"[Lambda] Launched instance {instance_ids[0]}, waiting for IP...")
-
-    # Poll for IP
-    import time
-    for _ in range(60):
-        time.sleep(5)
-        info = _lambda_api("GET", f"instances/{_lambda_state['instance_id']}")
-        instance = info.get("data", {})
-        ip = instance.get("ip")
-        status = instance.get("status")
-        if ip and status == "active":
-            _lambda_state["ip"] = ip
-            break
-    else:
-        _lambda_state["status"] = "off"
-        print("[Lambda] Timed out waiting for instance")
-        return False
-
-    print(f"[Lambda] Instance ready at {ip}, setting up...")
-    _lambda_state["status"] = "setup"
-
-    # Setup: copy files and install
     import subprocess
-    ip = _lambda_state["ip"]
-    base = os.path.dirname(os.path.abspath(__file__))
+    try:
+        _lambda_state["status"] = "starting"
+        _lambda_state["message"] = "Finding available GPU..."
 
-    # Wait for SSH
-    for _ in range(12):
+        # Find available region
+        types = _lambda_api("GET", "instance-types")
+        instance_info = types.get("data", {}).get(LAMBDA_INSTANCE_TYPE, {})
+        regions = instance_info.get("regions_with_capacity_available", [])
+        if not regions:
+            _lambda_state["status"] = "off"
+            _lambda_state["message"] = f"No capacity for {LAMBDA_INSTANCE_TYPE}"
+            print(f"[Lambda] No capacity for {LAMBDA_INSTANCE_TYPE}")
+            return False
+
+        region = LAMBDA_REGION or regions[0]["name"]
+        _lambda_state["message"] = f"Launching {LAMBDA_INSTANCE_TYPE} in {region}..."
+
+        # Launch
+        result = _lambda_api("POST", "instance-operations/launch", {
+            "region_name": region,
+            "instance_type_name": LAMBDA_INSTANCE_TYPE,
+            "ssh_key_names": [LAMBDA_SSH_KEY_NAME],
+            "quantity": 1,
+        })
+        instance_ids = result.get("data", {}).get("instance_ids", [])
+        if not instance_ids:
+            _lambda_state["status"] = "off"
+            error_msg = result.get("error", {}).get("message", str(result))
+            _lambda_state["message"] = f"Launch failed: {error_msg}"
+            print(f"[Lambda] Launch failed: {result}")
+            return False
+
+        _lambda_state["instance_id"] = instance_ids[0]
+        _lambda_state["message"] = "Waiting for instance to boot..."
+        print(f"[Lambda] Launched instance {instance_ids[0]}, waiting for IP...")
+
+        # Poll for IP
+        import time as _time
+        for attempt in range(60):
+            _time.sleep(5)
+            try:
+                info = _lambda_api("GET", f"instances/{_lambda_state['instance_id']}")
+                instance = info.get("data", {})
+                ip = instance.get("ip")
+                status = instance.get("status")
+                _lambda_state["message"] = f"Instance status: {status or 'pending'}... ({attempt*5}s)"
+                if ip and status == "active":
+                    _lambda_state["ip"] = ip
+                    break
+            except Exception as e:
+                _lambda_state["message"] = f"Polling... ({attempt*5}s)"
+        else:
+            _lambda_state["status"] = "off"
+            _lambda_state["message"] = "Timed out waiting for instance"
+            print("[Lambda] Timed out waiting for instance")
+            return False
+
+        ip = _lambda_state["ip"]
+        print(f"[Lambda] Instance ready at {ip}")
+
+        # Wait for SSH
+        _lambda_state["status"] = "setup"
+        _lambda_state["message"] = f"Waiting for SSH on {ip}..."
+        for attempt in range(24):
+            try:
+                r = subprocess.run(
+                    ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519"), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                     f"ubuntu@{ip}", "echo ready"],
+                    capture_output=True, timeout=10, text=True)
+                if r.returncode == 0:
+                    break
+            except Exception:
+                pass
+            _lambda_state["message"] = f"Waiting for SSH... ({attempt*5}s)"
+            _time.sleep(5)
+        else:
+            _lambda_state["status"] = "off"
+            _lambda_state["message"] = "SSH connection failed"
+            return False
+
+        # Copy files
+        _lambda_state["message"] = "Copying project files..."
+        base = os.path.dirname(os.path.abspath(__file__))
+        files = [f for f in [
+            f"{base}/backend_gpu.py", f"{base}/controlnet_gpu.py",
+            f"{base}/setup_lambda.sh"
+        ] if os.path.exists(f)]
+        subprocess.run(
+            ["scp", "-i", os.path.expanduser("~/.ssh/id_ed25519"), "-o", "StrictHostKeyChecking=no"] + files +
+            [f"ubuntu@{ip}:~/pose-demo/"],
+            capture_output=True, timeout=60)
+
+        # Run setup
+        _lambda_state["message"] = "Installing dependencies (~2 min)..."
+        r = subprocess.run(
+            ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519"), "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
+             "bash ~/pose-demo/setup_lambda.sh"],
+            capture_output=True, timeout=600, text=True)
+        if r.returncode != 0:
+            print(f"[Lambda] Setup failed: {r.stderr[-500:]}")
+            _lambda_state["message"] = "Setup failed — check logs"
+
+        # Start backend
+        _lambda_state["message"] = "Starting backend server..."
+        instance_id = _lambda_state["instance_id"]
+        subprocess.run(
+            ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519"), "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
+             f"cd ~/pose-demo && LAMBDA_API_KEY={LAMBDA_API_KEY} LAMBDA_INSTANCE_ID={instance_id} "
+             f"IDLE_TIMEOUT={_lambda_state['idle_timeout']} "
+             "nohup python3 backend_gpu.py > backend.log 2>&1 &"],
+            capture_output=True, timeout=10)
+        _time.sleep(8)
+
+        # Verify backend is running
+        _lambda_state["message"] = "Verifying backend..."
         try:
-            subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
-                           f"ubuntu@{ip}", "echo ready"], capture_output=True, timeout=10)
-            break
-        except Exception:
-            time.sleep(5)
+            r = http_requests.get(f"http://{ip}:5005/", timeout=5)
+            if r.status_code != 200:
+                raise Exception(f"Backend returned {r.status_code}")
+        except Exception as e:
+            _lambda_state["message"] = f"Backend failed to start: {e}"
+            print(f"[Lambda] Backend verification failed: {e}")
+            # Don't return false — it might just need more time
 
-    # Copy files
-    subprocess.run(["scp", "-o", "StrictHostKeyChecking=no",
-                    f"{base}/backend_gpu.py", f"{base}/controlnet_gpu.py",
-                    f"{base}/setup_lambda.sh",
-                    f"ubuntu@{ip}:~/pose-demo/"], capture_output=True, timeout=30)
+        # Connect frontend
+        global BACKEND_URL
+        BACKEND_URL = f"http://{ip}:5005"
+        _lambda_state["status"] = "ready"
+        _lambda_state["last_activity"] = time.time()
+        _lambda_state["message"] = ""
+        print(f"[Lambda] Backend ready at {BACKEND_URL}")
+        return True
 
-    # Run setup
-    subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
-                    "bash ~/pose-demo/setup_lambda.sh"], capture_output=True, timeout=300)
-
-    # Start backend with self-termination enabled
-    instance_id = _lambda_state["instance_id"]
-    subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
-                    f"cd ~/pose-demo && LAMBDA_API_KEY={LAMBDA_API_KEY} LAMBDA_INSTANCE_ID={instance_id} "
-                    f"IDLE_TIMEOUT={_lambda_state['idle_timeout']} "
-                    "nohup python3 backend_gpu.py > backend.log 2>&1 &"],
-                   capture_output=True, timeout=10)
-    time.sleep(5)
-
-    # Connect frontend
-    global BACKEND_URL
-    BACKEND_URL = f"http://{ip}:5005"
-    _lambda_state["status"] = "ready"
-    _lambda_state["last_activity"] = time.time()
-    print(f"[Lambda] Backend ready at {BACKEND_URL}")
-    return True
+    except Exception as e:
+        _lambda_state["status"] = "off"
+        _lambda_state["message"] = f"Error: {str(e)}"
+        print(f"[Lambda] Launch error: {e}")
+        import traceback; traceback.print_exc()
+        return False
 
 
 def _lambda_terminate():
