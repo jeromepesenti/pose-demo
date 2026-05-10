@@ -1,0 +1,696 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YouTube Vision Demo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e; color: #eee;
+    font-family: system-ui, sans-serif;
+    min-height: 100vh;
+  }
+  #layout {
+    display: flex; min-height: 100vh;
+  }
+
+  /* ── Sidebar ── */
+  #sidebar {
+    width: 260px; min-width: 260px;
+    background: #16213e;
+    padding: 16px;
+    display: flex; flex-direction: column; gap: 12px;
+    border-right: 1px solid #0f3460;
+    overflow-y: auto;
+  }
+  #sidebar h2 {
+    font-size: 0.9rem; color: #aaa;
+    text-transform: uppercase; letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+  .video-card {
+    cursor: pointer; border-radius: 8px;
+    overflow: hidden; background: #1a1a2e;
+    border: 2px solid transparent;
+    transition: border-color 0.2s, transform 0.15s;
+  }
+  .video-card:hover { border-color: #e94560; transform: scale(1.02); }
+  .video-card.active { border-color: #e94560; }
+  .video-card img {
+    width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block;
+  }
+  .video-card .card-title {
+    padding: 6px 8px; font-size: 0.75rem; color: #ccc;
+    line-height: 1.3;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  /* ── Main ── */
+  #main {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; padding: 20px;
+    overflow-y: auto;
+  }
+  h1 { margin-bottom: 10px; font-size: 1.4rem; }
+  #info { font-size: 0.85rem; color: #aaa; margin-bottom: 16px; }
+  .row {
+    display: flex; gap: 8px; margin-bottom: 12px;
+    width: 100%; max-width: 800px; align-items: center;
+  }
+  #url-input {
+    flex: 1; padding: 10px 14px; font-size: 1rem;
+    border: 1px solid #333; border-radius: 6px;
+    background: #16213e; color: #eee; outline: none;
+  }
+  #url-input:focus { border-color: #e94560; }
+  select {
+    padding: 10px 14px; font-size: 1rem;
+    border: 1px solid #333; border-radius: 6px;
+    background: #16213e; color: #eee; outline: none;
+    cursor: pointer; flex: 1;
+  }
+  button {
+    padding: 10px 24px; font-size: 1rem; border: none;
+    border-radius: 6px; background: #e94560; color: #fff; cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover { background: #c73650; }
+  button:disabled { background: #555; cursor: wait; }
+  #status { font-size: 0.9rem; color: #aaa; margin-bottom: 12px; min-height: 1.2em; }
+  #output { text-align: center; width: 100%; max-width: 800px; }
+  #output img {
+    border-radius: 8px; width: 100%; background: #000; display: block;
+  }
+  #stats {
+    display: flex; gap: 16px; justify-content: center;
+    margin-top: 8px; font-size: 0.8rem; font-variant-numeric: tabular-nums;
+  }
+  .stat { padding: 4px 10px; border-radius: 4px; background: #16213e; }
+  .stat-label { color: #777; }
+  .stat-value { color: #eee; font-weight: 600; }
+  .stat-good { color: #16c79a; }
+  .stat-warn { color: #f5a623; }
+  .stat-bad { color: #e94560; }
+  #controls {
+    display: flex; align-items: center; gap: 10px;
+    margin-top: 10px; width: 100%;
+  }
+  #play-btn {
+    padding: 8px 16px; font-size: 1.2rem; min-width: 44px;
+  }
+  #slider {
+    flex: 1; height: 6px; cursor: pointer;
+    accent-color: #e94560;
+  }
+  #time-display {
+    font-size: 0.85rem; color: #aaa; min-width: 100px; text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  @media (max-width: 768px) {
+    #layout { flex-direction: column; }
+    #sidebar {
+      width: 100%; min-width: unset;
+      flex-direction: row; overflow-x: auto;
+      border-right: none; border-bottom: 1px solid #0f3460;
+      padding: 10px;
+    }
+    #sidebar h2 { display: none; }
+    .video-card { min-width: 160px; }
+  }
+</style>
+</head>
+<body>
+
+<div id="layout">
+
+  <!-- Sidebar with saved videos -->
+  <div id="sidebar">
+    <h2>Recent Videos</h2>
+    <div id="video-list"></div>
+    <div id="no-videos" style="color:#555; font-size:0.8rem; padding:8px;">
+      Upload a video to get started
+    </div>
+  </div>
+
+  <!-- Main content -->
+  <div id="main">
+    <h1>YouTube Vision Demo</h1>
+    <div id="info">Pick an example video or paste a YouTube URL</div>
+    <div id="backend-status" style="font-size:0.75rem;margin-bottom:8px;"></div>
+
+    <div class="row">
+      <input id="url-input" type="text" placeholder="Paste YouTube URL here...">
+      <button id="go-btn" onclick="go()">Go</button>
+      <span style="color:#555;">or</span>
+      <label style="cursor:pointer;">
+        <button onclick="document.getElementById('vid-upload').click(); return false;">Upload</button>
+        <input id="vid-upload" type="file" accept="video/*" style="display:none;" onchange="uploadVideo(this)">
+      </label>
+    </div>
+
+    <div class="row">
+      <select id="mode-select">
+        <optgroup label="MediaPipe">
+          <option value="pose">Pose Estimation (MediaPipe)</option>
+          <option value="shadow">Shadow Silhouette</option>
+          <option value="face_mesh">Face Mesh</option>
+          <option value="hands">Hand Tracking</option>
+          <option value="face_detect">Face Detection</option>
+          <option value="objects">Object Detection</option>
+        </optgroup>
+        <optgroup label="RTMPose (MMPose)">
+          <option value="rtmpose_body">RTMPose Body</option>
+          <option value="rtmpose_whole">RTMPose Wholebody (133 pts)</option>
+          <option value="rtmpose_shadow">RTMPose Body Shadow</option>
+          <option value="rtmpose_costume">RTMPose Costume Transfer</option>
+        </optgroup>
+        <optgroup label="YOLO">
+          <option value="yolo_shadow">YOLO Shadow (per-person)</option>
+        </optgroup>
+        <optgroup label="Detectron2">
+          <option value="d2_keypoint">Keypoint R-CNN (pose+mask)</option>
+          <option value="d2_panoptic">Panoptic Segmentation</option>
+          <option value="d2_densepose">DensePose (body surface)</option>
+        </optgroup>
+        <optgroup label="Generative" id="gen-group" style="display:none;">
+          <option value="controlnet">ControlNet Pose (SD 1.5)</option>
+          <option value="controlnet_video">AnimateDiff + ControlNet (video)</option>
+        </optgroup>
+      </select>
+    </div>
+
+    <div class="row" id="prompt-row" style="display:none;">
+      <input id="prompt-input" type="text" placeholder="Describe the person..." value="person dancing, professional photo, studio lighting, high quality"
+        style="flex:1; padding:10px 14px; font-size:1rem; border:1px solid #333; border-radius:6px; background:#16213e; color:#eee; outline:none;">
+    </div>
+
+    <div class="row" id="ref-row" style="display:none;">
+      <label style="flex:1; display:flex; align-items:center; gap:8px; cursor:pointer;
+        padding:10px 14px; border:1px dashed #555; border-radius:6px; background:#16213e; color:#aaa;">
+        <span id="ref-label">Upload reference person image...</span>
+        <input id="ref-input" type="file" accept="image/*" style="display:none;" onchange="uploadRef(this)">
+      </label>
+      <img id="ref-preview" style="display:none; height:48px; border-radius:4px;">
+    </div>
+
+    <div id="status"></div>
+
+    <div id="output" style="display:none;">
+      <img id="frame-img">
+      <div id="controls">
+        <button id="play-btn" onclick="togglePlay()">&#9654;</button>
+        <input id="slider" type="range" min="0" max="1000" value="0">
+        <span id="time-display">0:00 / 0:00</span>
+      </div>
+      <div id="stats">
+        <div class="stat"><span class="stat-label">Process: </span><span class="stat-value" id="stat-proc">—</span></div>
+        <div class="stat"><span class="stat-label">Round-trip: </span><span class="stat-value" id="stat-rtt">—</span></div>
+        <div class="stat"><span class="stat-label">FPS: </span><span class="stat-value" id="stat-fps">—</span></div>
+        <div class="stat"><span class="stat-label">Status: </span><span class="stat-value" id="stat-status">—</span></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let currentUrl = '';
+let playing = false;
+let duration = 0;
+let fps = 30;
+let currentTime = 0;
+let pendingFrame = false;
+let rafId = null;
+let seeking = false;
+
+const img = document.getElementById('frame-img');
+const slider = document.getElementById('slider');
+const playBtn = document.getElementById('play-btn');
+const timeDisplay = document.getElementById('time-display');
+const statusEl = document.getElementById('status');
+const output = document.getElementById('output');
+
+function fmtTime(s) {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return m + ':' + String(sec).padStart(2, '0');
+}
+
+let refUploaded = false;
+
+function getMode() {
+  const mode = document.getElementById('mode-select').value;
+  document.getElementById('ref-row').style.display =
+    (mode === 'rtmpose_costume') ? 'flex' : 'none';
+  document.getElementById('prompt-row').style.display =
+    mode.startsWith('controlnet') ? 'flex' : 'none';
+  return mode;
+}
+
+// Check if controlnet is available and show the option group
+fetch('/modes').then(r => r.json()).then(modes => {
+  if (modes.includes('controlnet')) {
+    document.getElementById('gen-group').style.display = '';
+  }
+});
+
+// Load saved videos into sidebar
+function loadVideoList() {
+  fetch('/videos').then(r => r.json()).then(videos => {
+    const list = document.getElementById('video-list');
+    const noVids = document.getElementById('no-videos');
+    list.innerHTML = '';
+    if (videos.length === 0) {
+      noVids.style.display = 'block';
+      return;
+    }
+    noVids.style.display = 'none';
+    videos.forEach(v => {
+      const card = document.createElement('div');
+      card.className = 'video-card';
+      card.dataset.videoId = v.id;
+      card.onclick = () => pickSavedVideo(v.id, card);
+      card.innerHTML = '<img src="/thumbnail/' + v.id + '" alt="' + v.name + '">'
+        + '<div class="card-title">' + v.name + '</div>';
+      list.appendChild(card);
+    });
+  });
+}
+
+async function pickSavedVideo(videoId, card) {
+  document.querySelectorAll('.video-card').forEach(c => c.classList.remove('active'));
+  if (card) card.classList.add('active');
+  const btn = document.getElementById('go-btn');
+  btn.disabled = true;
+  stop();
+  output.style.display = 'none';
+  statusEl.textContent = 'Loading video...';
+
+  try {
+    const resp = await fetch('/load_video/' + videoId);
+    const data = await resp.json();
+    if (data.error) {
+      statusEl.textContent = 'Error: ' + data.error;
+      btn.disabled = false;
+      return;
+    }
+    currentUrl = '__saved_' + videoId;
+    duration = data.duration;
+    fps = data.fps;
+    currentTime = 0;
+    slider.value = 0;
+    updateTimeDisplay();
+    output.style.display = 'block';
+    getMode();
+    statusEl.textContent = 'Ready — press play';
+    btn.disabled = false;
+    fetchFrame(0);
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+  }
+}
+
+// Dynamically load available modes from backend
+fetch('/modes').then(r => r.json()).then(modes => {
+  const select = document.getElementById('mode-select');
+  // Show generative group if controlnet available
+  if (modes.includes('controlnet')) {
+    document.getElementById('gen-group').style.display = '';
+  }
+  // Show detectron2 group if available
+  const d2group = document.getElementById('d2-group');
+  if (d2group && modes.some(m => m.startsWith('d2_'))) {
+    d2group.style.display = '';
+  }
+});
+
+loadVideoList();
+
+// Check backend status
+fetch('/backend_status').then(r => r.json()).then(s => {
+  const el = document.getElementById('backend-status');
+  if (s.available) {
+    el.innerHTML = '<span style="color:#16c79a;">GPU backend connected</span>';
+  } else {
+    el.innerHTML = '<span style="color:#e94560;">GPU backend offline — processing will be slower</span>';
+  }
+});
+
+async function uploadRef(input) {
+  if (!input.files[0]) return;
+  const formData = new FormData();
+  formData.append('image', input.files[0]);
+  document.getElementById('ref-label').textContent = 'Uploading...';
+  try {
+    const resp = await fetch('/upload_reference', { method: 'POST', body: formData });
+    const data = await resp.json();
+    if (data.error) {
+      document.getElementById('ref-label').textContent = 'Error: ' + data.error;
+      return;
+    }
+    document.getElementById('ref-label').textContent = data.filename + ' (' + data.parts + ')';
+    document.getElementById('ref-preview').src = '/reference_preview?' + Date.now();
+    document.getElementById('ref-preview').style.display = 'block';
+    refUploaded = true;
+    if (currentUrl) fetchFrame(currentTime);
+  } catch (e) {
+    document.getElementById('ref-label').textContent = 'Upload failed';
+  }
+}
+
+function pickVideo(url, card) {
+  document.getElementById('url-input').value = url;
+  document.querySelectorAll('.video-card').forEach(c => c.classList.remove('active'));
+  if (card) card.classList.add('active');
+  go();
+}
+
+async function uploadVideo(input) {
+  if (!input.files[0]) return;
+  const btn = document.getElementById('go-btn');
+  btn.disabled = true;
+  stop();
+  output.style.display = 'none';
+  statusEl.textContent = 'Uploading video (' + (input.files[0].size / 1e6).toFixed(1) + ' MB)...';
+
+  const formData = new FormData();
+  formData.append('video', input.files[0]);
+  try {
+    const resp = await fetch('/upload_video', { method: 'POST', body: formData });
+    const data = await resp.json();
+    if (data.error) {
+      statusEl.textContent = 'Error: ' + data.error;
+      btn.disabled = false;
+      return;
+    }
+    currentUrl = '__uploaded__';
+    duration = data.duration;
+    fps = data.fps;
+    currentTime = 0;
+    slider.value = 0;
+    updateTimeDisplay();
+    output.style.display = 'block';
+    getMode();
+    statusEl.textContent = 'Ready — press play';
+    btn.disabled = false;
+    fetchFrame(0);
+    // Dynamically load available modes from backend
+fetch('/modes').then(r => r.json()).then(modes => {
+  const select = document.getElementById('mode-select');
+  // Show generative group if controlnet available
+  if (modes.includes('controlnet')) {
+    document.getElementById('gen-group').style.display = '';
+  }
+  // Show detectron2 group if available
+  const d2group = document.getElementById('d2-group');
+  if (d2group && modes.some(m => m.startsWith('d2_'))) {
+    d2group.style.display = '';
+  }
+});
+
+loadVideoList();
+
+// Check backend status
+fetch('/backend_status').then(r => r.json()).then(s => {
+  const el = document.getElementById('backend-status');
+  if (s.available) {
+    el.innerHTML = '<span style="color:#16c79a;">GPU backend connected</span>';
+  } else {
+    el.innerHTML = '<span style="color:#e94560;">GPU backend offline — processing will be slower</span>';
+  }
+});
+  } catch (e) {
+    statusEl.textContent = 'Upload failed: ' + e.message;
+    btn.disabled = false;
+  }
+  input.value = '';
+}
+
+async function go() {
+  const url = document.getElementById('url-input').value.trim();
+  if (!url) return;
+  const btn = document.getElementById('go-btn');
+  btn.disabled = true;
+  stop();
+  output.style.display = 'none';
+
+  // Highlight matching sidebar card
+  document.querySelectorAll('.video-card').forEach(c => {
+    const onclick = c.getAttribute('onclick') || '';
+    if (onclick.includes(url)) c.classList.add('active');
+    else c.classList.remove('active');
+  });
+
+  if (url !== currentUrl) {
+    statusEl.textContent = 'Downloading video...';
+    try {
+      const resp = await fetch('/download', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({url})
+      });
+      const data = await resp.json();
+      if (data.error) {
+        statusEl.textContent = 'Error: ' + data.error;
+        btn.disabled = false;
+        return;
+      }
+      currentUrl = url;
+      duration = data.duration;
+      fps = data.fps;
+      // Dynamically load available modes from backend
+fetch('/modes').then(r => r.json()).then(modes => {
+  const select = document.getElementById('mode-select');
+  // Show generative group if controlnet available
+  if (modes.includes('controlnet')) {
+    document.getElementById('gen-group').style.display = '';
+  }
+  // Show detectron2 group if available
+  const d2group = document.getElementById('d2-group');
+  if (d2group && modes.some(m => m.startsWith('d2_'))) {
+    d2group.style.display = '';
+  }
+});
+
+loadVideoList();
+
+// Check backend status
+fetch('/backend_status').then(r => r.json()).then(s => {
+  const el = document.getElementById('backend-status');
+  if (s.available) {
+    el.innerHTML = '<span style="color:#16c79a;">GPU backend connected</span>';
+  } else {
+    el.innerHTML = '<span style="color:#e94560;">GPU backend offline — processing will be slower</span>';
+  }
+});
+    } catch (e) {
+      statusEl.textContent = 'Error: ' + e.message;
+      btn.disabled = false;
+      return;
+    }
+  }
+
+  currentTime = 0;
+  slider.value = 0;
+  updateTimeDisplay();
+  output.style.display = 'block';
+  statusEl.textContent = 'Ready — press play';
+  getMode();
+  btn.disabled = false;
+
+  fetchFrame(0);
+}
+
+let lastFrameTime = 0;
+let fpsCount = 0;
+let fpsTimer = performance.now();
+let currentFps = 0;
+
+function fetchFrame(t) {
+  if (pendingFrame) return;
+  pendingFrame = true;
+  const mode = getMode();
+  let frameUrl = '/frame/' + mode + '?t=' + t.toFixed(3) + '&_=' + Date.now();
+  if (mode.startsWith('controlnet')) {
+    frameUrl += '&prompt=' + encodeURIComponent(
+      document.getElementById('prompt-input').value.trim());
+  }
+
+  const rttStart = performance.now();
+
+  fetch(frameUrl).then(resp => {
+    const procMs = resp.headers.get('X-Process-Ms');
+    return resp.blob().then(blob => ({ blob, procMs }));
+  }).then(({ blob, procMs }) => {
+    const rttMs = Math.round(performance.now() - rttStart);
+    const url = URL.createObjectURL(blob);
+    img.src = url;
+
+    // Update stats
+    if (procMs) {
+      const pm = parseInt(procMs);
+      const procEl = document.getElementById('stat-proc');
+      procEl.textContent = pm + 'ms';
+      procEl.className = 'stat-value ' + (pm < 33 ? 'stat-good' : pm < 100 ? 'stat-warn' : 'stat-bad');
+    }
+
+    const rttEl = document.getElementById('stat-rtt');
+    rttEl.textContent = rttMs + 'ms';
+    rttEl.className = 'stat-value ' + (rttMs < 50 ? 'stat-good' : rttMs < 150 ? 'stat-warn' : 'stat-bad');
+
+    // FPS calculation
+    fpsCount++;
+    const now = performance.now();
+    if (now - fpsTimer >= 1000) {
+      currentFps = fpsCount;
+      fpsCount = 0;
+      fpsTimer = now;
+    }
+    const fpsEl = document.getElementById('stat-fps');
+    fpsEl.textContent = currentFps || '...';
+    fpsEl.className = 'stat-value ' + (currentFps >= 24 ? 'stat-good' : currentFps >= 10 ? 'stat-warn' : 'stat-bad');
+
+    // Real-time status
+    const statusEl2 = document.getElementById('stat-status');
+    const videoFps = fps || 30;
+    if (currentFps >= videoFps * 0.9) {
+      statusEl2.textContent = 'Real-time';
+      statusEl2.className = 'stat-value stat-good';
+    } else if (currentFps >= videoFps * 0.5) {
+      statusEl2.textContent = 'Slight lag';
+      statusEl2.className = 'stat-value stat-warn';
+    } else if (currentFps > 0) {
+      statusEl2.textContent = 'Lagging (' + Math.round(currentFps/videoFps*100) + '% speed)';
+      statusEl2.className = 'stat-value stat-bad';
+    } else {
+      statusEl2.textContent = '—';
+      statusEl2.className = 'stat-value';
+    }
+
+    pendingFrame = false;
+  }).catch(() => {
+    pendingFrame = false;
+  });
+}
+
+function updateTimeDisplay() {
+  timeDisplay.textContent = fmtTime(currentTime) + ' / ' + fmtTime(duration);
+}
+
+function togglePlay() {
+  if (playing) {
+    stop();
+  } else {
+    play();
+  }
+}
+
+let sliderInterval = null;
+let statsInterval = null;
+
+function play() {
+  playing = true;
+  playBtn.innerHTML = '&#9646;&#9646;';
+  statusEl.textContent = 'Streaming — ' + document.getElementById('mode-select').selectedOptions[0].text;
+
+  // Use MJPEG stream for continuous playback (no per-frame round-trip)
+  const mode = getMode();
+  let streamUrl = '/stream/' + mode + '?t=' + currentTime.toFixed(3);
+  if (mode.startsWith('controlnet')) {
+    streamUrl += '&prompt=' + encodeURIComponent(
+      document.getElementById('prompt-input').value.trim());
+  }
+
+  img.src = streamUrl;
+
+  // Update slider based on elapsed time
+  const startTime = currentTime;
+  const startWall = performance.now();
+  sliderInterval = setInterval(() => {
+    if (!playing) return;
+    currentTime = startTime + (performance.now() - startWall) / 1000;
+    if (currentTime >= duration) {
+      currentTime = duration;
+      stop();
+      return;
+    }
+    slider.value = Math.round((currentTime / duration) * 1000);
+    updateTimeDisplay();
+  }, 100);
+
+  // Poll server for live stats during streaming
+  statsInterval = setInterval(() => {
+    if (!playing) return;
+    fetch('/stream_stats').then(r => r.json()).then(s => {
+      const procEl = document.getElementById('stat-proc');
+      procEl.textContent = s.proc_ms + 'ms';
+      procEl.className = 'stat-value ' + (s.proc_ms < 33 ? 'stat-good' : s.proc_ms < 100 ? 'stat-warn' : 'stat-bad');
+
+      document.getElementById('stat-rtt').textContent = 'stream';
+      document.getElementById('stat-rtt').className = 'stat-value stat-good';
+
+      const fpsEl = document.getElementById('stat-fps');
+      fpsEl.textContent = s.fps;
+      fpsEl.className = 'stat-value ' + (s.fps >= 24 ? 'stat-good' : s.fps >= 10 ? 'stat-warn' : 'stat-bad');
+
+      const videoFps = fps || 30;
+      const statusEl2 = document.getElementById('stat-status');
+      if (s.fps >= videoFps * 0.9) {
+        statusEl2.textContent = 'Real-time';
+        statusEl2.className = 'stat-value stat-good';
+      } else if (s.fps >= videoFps * 0.5) {
+        statusEl2.textContent = 'Slight lag';
+        statusEl2.className = 'stat-value stat-warn';
+      } else if (s.fps > 0) {
+        statusEl2.textContent = 'Lagging (' + Math.round(s.fps/videoFps*100) + '%)';
+        statusEl2.className = 'stat-value stat-bad';
+      }
+    }).catch(() => {});
+  }, 500);
+}
+
+function stop() {
+  playing = false;
+  playBtn.innerHTML = '&#9654;';
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = null;
+  if (sliderInterval) { clearInterval(sliderInterval); sliderInterval = null; }
+  if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
+
+  // Switch from MJPEG stream back to single frame
+  if (img.src.includes('/stream/')) {
+    fetchFrame(currentTime);
+  }
+  if (statusEl.textContent.startsWith('Streaming') || statusEl.textContent.startsWith('Playing'))
+    statusEl.textContent = 'Paused';
+}
+
+slider.addEventListener('input', () => {
+  seeking = true;
+  currentTime = (slider.value / 1000) * duration;
+  updateTimeDisplay();
+  fetchFrame(currentTime);
+});
+
+slider.addEventListener('change', () => {
+  seeking = false;
+  currentTime = (slider.value / 1000) * duration;
+  updateTimeDisplay();
+  fetchFrame(currentTime);
+});
+
+document.getElementById('mode-select').addEventListener('change', () => {
+  if (currentUrl) {
+    fetchFrame(currentTime);
+    if (playing) {
+      statusEl.textContent = 'Playing — ' + document.getElementById('mode-select').selectedOptions[0].text;
+    }
+  }
+});
+</script>
+</body>
+</html>
