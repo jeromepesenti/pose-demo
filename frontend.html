@@ -139,7 +139,14 @@
   <div id="main">
     <h1>YouTube Vision Demo</h1>
     <div id="info">Pick an example video or paste a YouTube URL</div>
-    <div id="backend-status" style="font-size:0.75rem;margin-bottom:8px;"></div>
+    <div id="backend-status" style="font-size:0.75rem;margin-bottom:8px;display:flex;align-items:center;gap:8px;">
+      <span id="backend-info"></span>
+      <button id="backend-toggle" onclick="toggleBackendInput()" style="padding:2px 8px;font-size:0.7rem;background:#333;border:1px solid #555;color:#aaa;border-radius:4px;cursor:pointer;">change</button>
+    </div>
+    <div id="backend-input-row" class="row" style="display:none;margin-bottom:8px;">
+      <input id="backend-url-input" type="text" placeholder="http://gpu-ip:5005" style="flex:1;padding:6px 10px;font-size:0.85rem;border:1px solid #333;border-radius:6px;background:#16213e;color:#eee;outline:none;">
+      <button onclick="setBackend()" style="padding:6px 14px;font-size:0.85rem;">Connect</button>
+    </div>
 
     <div class="row">
       <input id="url-input" type="text" placeholder="Paste YouTube URL here...">
@@ -331,14 +338,41 @@ fetch('/modes').then(r => r.json()).then(modes => {
 loadVideoList();
 
 // Check backend status
-fetch('/backend_status').then(r => r.json()).then(s => {
-  const el = document.getElementById('backend-status');
-  if (s.available) {
-    el.innerHTML = '<span style="color:#16c79a;">GPU backend connected</span>';
-  } else {
-    el.innerHTML = '<span style="color:#e94560;">GPU backend offline — processing will be slower</span>';
-  }
-});
+function refreshBackendStatus() {
+  fetch('/backend_status').then(r => r.json()).then(s => {
+    const el = document.getElementById('backend-info');
+    if (s.available) {
+      const url = s.url || 'unknown';
+      const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
+      const label = isLocal ? 'local machine' : url.replace('http://', '').replace(':5005', '');
+      el.innerHTML = '<span style="color:#16c79a;">&#9679;</span> Backend: <strong>' + label + '</strong>'
+        + (s.cuda ? ' <span style="color:#16c79a;">(CUDA GPU)</span>' : ' <span style="color:#f5a623;">(CPU)</span>');
+    } else {
+      el.innerHTML = '<span style="color:#e94560;">&#9679;</span> Backend offline';
+    }
+    document.getElementById('backend-url-input').value = s.url || '';
+  });
+}
+
+function toggleBackendInput() {
+  const row = document.getElementById('backend-input-row');
+  row.style.display = row.style.display === 'none' ? 'flex' : 'none';
+}
+
+function setBackend() {
+  const url = document.getElementById('backend-url-input').value.trim();
+  if (!url) return;
+  fetch('/set_backend', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url})
+  }).then(r => r.json()).then(data => {
+    document.getElementById('backend-input-row').style.display = 'none';
+    refreshBackendStatus();
+  });
+}
+
+refreshBackendStatus();
 
 async function uploadRef(input) {
   if (!input.files[0]) return;
@@ -415,14 +449,41 @@ fetch('/modes').then(r => r.json()).then(modes => {
 loadVideoList();
 
 // Check backend status
-fetch('/backend_status').then(r => r.json()).then(s => {
-  const el = document.getElementById('backend-status');
-  if (s.available) {
-    el.innerHTML = '<span style="color:#16c79a;">GPU backend connected</span>';
-  } else {
-    el.innerHTML = '<span style="color:#e94560;">GPU backend offline — processing will be slower</span>';
-  }
-});
+function refreshBackendStatus() {
+  fetch('/backend_status').then(r => r.json()).then(s => {
+    const el = document.getElementById('backend-info');
+    if (s.available) {
+      const url = s.url || 'unknown';
+      const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
+      const label = isLocal ? 'local machine' : url.replace('http://', '').replace(':5005', '');
+      el.innerHTML = '<span style="color:#16c79a;">&#9679;</span> Backend: <strong>' + label + '</strong>'
+        + (s.cuda ? ' <span style="color:#16c79a;">(CUDA GPU)</span>' : ' <span style="color:#f5a623;">(CPU)</span>');
+    } else {
+      el.innerHTML = '<span style="color:#e94560;">&#9679;</span> Backend offline';
+    }
+    document.getElementById('backend-url-input').value = s.url || '';
+  });
+}
+
+function toggleBackendInput() {
+  const row = document.getElementById('backend-input-row');
+  row.style.display = row.style.display === 'none' ? 'flex' : 'none';
+}
+
+function setBackend() {
+  const url = document.getElementById('backend-url-input').value.trim();
+  if (!url) return;
+  fetch('/set_backend', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url})
+  }).then(r => r.json()).then(data => {
+    document.getElementById('backend-input-row').style.display = 'none';
+    refreshBackendStatus();
+  });
+}
+
+refreshBackendStatus();
   } catch (e) {
     statusEl.textContent = 'Upload failed: ' + e.message;
     btn.disabled = false;
@@ -479,14 +540,41 @@ fetch('/modes').then(r => r.json()).then(modes => {
 loadVideoList();
 
 // Check backend status
-fetch('/backend_status').then(r => r.json()).then(s => {
-  const el = document.getElementById('backend-status');
-  if (s.available) {
-    el.innerHTML = '<span style="color:#16c79a;">GPU backend connected</span>';
-  } else {
-    el.innerHTML = '<span style="color:#e94560;">GPU backend offline — processing will be slower</span>';
-  }
-});
+function refreshBackendStatus() {
+  fetch('/backend_status').then(r => r.json()).then(s => {
+    const el = document.getElementById('backend-info');
+    if (s.available) {
+      const url = s.url || 'unknown';
+      const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
+      const label = isLocal ? 'local machine' : url.replace('http://', '').replace(':5005', '');
+      el.innerHTML = '<span style="color:#16c79a;">&#9679;</span> Backend: <strong>' + label + '</strong>'
+        + (s.cuda ? ' <span style="color:#16c79a;">(CUDA GPU)</span>' : ' <span style="color:#f5a623;">(CPU)</span>');
+    } else {
+      el.innerHTML = '<span style="color:#e94560;">&#9679;</span> Backend offline';
+    }
+    document.getElementById('backend-url-input').value = s.url || '';
+  });
+}
+
+function toggleBackendInput() {
+  const row = document.getElementById('backend-input-row');
+  row.style.display = row.style.display === 'none' ? 'flex' : 'none';
+}
+
+function setBackend() {
+  const url = document.getElementById('backend-url-input').value.trim();
+  if (!url) return;
+  fetch('/set_backend', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url})
+  }).then(r => r.json()).then(data => {
+    document.getElementById('backend-input-row').style.display = 'none';
+    refreshBackendStatus();
+  });
+}
+
+refreshBackendStatus();
     } catch (e) {
       statusEl.textContent = 'Error: ' + e.message;
       btn.disabled = false;

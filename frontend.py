@@ -331,10 +331,30 @@ def stream(mode):
 
 # ── Backend status ───────────────────────────────────────────────────
 
+@app.route("/set_backend", methods=["POST"])
+def set_backend():
+    global BACKEND_URL
+    data = request.json
+    url = data.get("url", "")
+    if not url:
+        return jsonify({"error": "No URL provided"})
+    BACKEND_URL = url
+    available = _backend_available()
+    return jsonify({"ok": True, "url": BACKEND_URL, "available": available})
+
+
 @app.route("/backend_status")
 def backend_status():
     available = _backend_available()
-    return jsonify({"available": available, "url": BACKEND_URL})
+    cuda = False
+    if available:
+        try:
+            r = http_requests.get(f"{BACKEND_URL}/", timeout=2)
+            data = r.json()
+            cuda = data.get("cuda", False)
+        except Exception:
+            pass
+    return jsonify({"available": available, "url": BACKEND_URL, "cuda": cuda})
 
 
 if __name__ == "__main__":
