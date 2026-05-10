@@ -125,9 +125,12 @@ def _lambda_launch():
     subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
                     "bash ~/pose-demo/setup_lambda.sh"], capture_output=True, timeout=300)
 
-    # Start backend
+    # Start backend with self-termination enabled
+    instance_id = _lambda_state["instance_id"]
     subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
-                    "cd ~/pose-demo && nohup python3 backend_gpu.py > backend.log 2>&1 &"],
+                    f"cd ~/pose-demo && LAMBDA_API_KEY={LAMBDA_API_KEY} LAMBDA_INSTANCE_ID={instance_id} "
+                    f"IDLE_TIMEOUT={_lambda_state['idle_timeout']} "
+                    "nohup python3 backend_gpu.py > backend.log 2>&1 &"],
                    capture_output=True, timeout=10)
     time.sleep(5)
 

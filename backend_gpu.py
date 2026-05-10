@@ -368,8 +368,54 @@ def _process_frame_simple(mode, processor, frame):
     return frame.copy()
 
 
+# ── Self-termination watchdog ─────────────────────────────────────────
+
+_last_request = time.time()
+IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", 900))  # 15 min default
+LAMBDA_API_KEY = os.environ.get("LAMBDA_API_KEY", "")
+INSTANCE_ID = os.environ.get("LAMBDA_INSTANCE_ID", "")
+
+
+@app.before_request
+def _track_activity():
+    global _last_request
+    _last_request = time.time()
+
+
+def _self_terminate():
+    """Terminate this Lambda instance via API."""
+    if not LAMBDA_API_KEY or not INSTANCE_ID:
+        print("[Watchdog] No API key or instance ID — shutting down process instead")
+        os._exit(0)
+    import requests as _req
+    print(f"[Watchdog] Terminating instance {INSTANCE_ID}...")
+    _req.post("https://cloud.lambdalabs.com/api/v1/instance-operations/terminate",
+              headers={"Authorization": f"Bearer {LAMBDA_API_KEY}"},
+              json={"instance_ids": [INSTANCE_ID]}, timeout=10)
+
+
+def _watchdog():
+    while True:
+        time.sleep(30)
+        idle = time.time() - _last_request
+        if idle > IDLE_TIMEOUT:
+            print(f"[Watchdog] Idle for {int(idle)}s (timeout: {IDLE_TIMEOUT}s). Shutting down.")
+            _self_terminate()
+            break
+        remaining = int(IDLE_TIMEOUT - idle)
+        if remaining % 300 < 30:  # log every ~5 min
+            print(f"[Watchdog] Idle {int(idle)}s / {IDLE_TIMEOUT}s — auto-shutdown in {remaining}s")
+
+
 if __name__ == "__main__":
     print("=== GPU Backend ===")
     print(f"CUDA: {_HAS_CUDA}")
     print(f"Detectron2: {_HAS_D2}")
+    print(f"Idle timeout: {IDLE_TIMEOUT}s")
+    if LAMBDA_API_KEY:
+        print(f"Self-termination: enabled (instance: {INSTANCE_ID or 'will use process exit'})")
+
+    # Start watchdog
+    threading.Thread(target=_watchdog, daemon=True).start()
+
     app.run(host="0.0.0.0", port=5005, threaded=True)
