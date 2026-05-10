@@ -17,15 +17,29 @@ from mediapipe.tasks.python.vision import (
     FaceDetector, FaceDetectorOptions,
 )
 from rtmlib import Body, Wholebody
+from ultralytics import YOLO
+
+# ControlNet: only available with CUDA
+_HAS_CUDA = False
+try:
+    import torch
+    _HAS_CUDA = torch.cuda.is_available()
+except ImportError:
+    pass
+
+if _HAS_CUDA:
+    from controlnet_gpu import generate as controlnet_generate
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max upload
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 current_video = {"path": None, "fps": 30, "duration": 0, "total_frames": 0}
-YT_DLP = os.path.join(BASE_DIR, "venv", "bin", "yt-dlp")
+import shutil
+YT_DLP = shutil.which("yt-dlp") or os.path.join(BASE_DIR, "venv", "bin", "yt-dlp")
 
 # Processor cache: keep one processor per mode alive to avoid reload cost
 _processor_cache = {}
@@ -41,7 +55,12 @@ MODES = {
     "rtmpose_body":  {"label": "RTMPose Body",                   "group": "RTMPose (MMPose)"},
     "rtmpose_whole": {"label": "RTMPose Wholebody (133 pts)",    "group": "RTMPose (MMPose)"},
     "rtmpose_shadow":{"label": "RTMPose Body Shadow",            "group": "RTMPose (MMPose)"},
+    "rtmpose_costume":{"label": "RTMPose Costume Transfer",      "group": "RTMPose (MMPose)"},
+    "yolo_shadow":   {"label": "YOLO Shadow (per-person)",       "group": "YOLO"},
 }
+
+if _HAS_CUDA:
+    MODES["controlnet"] = {"label": "ControlNet Pose (SD 1.5)", "group": "Generative"}
 
 # ── Connection definitions ───────────────────────────────────────────
 
@@ -203,6 +222,16 @@ HTML = """
   #output img {
     border-radius: 8px; width: 100%; background: #000; display: block;
   }
+  #stats {
+    display: flex; gap: 16px; justify-content: center;
+    margin-top: 8px; font-size: 0.8rem; font-variant-numeric: tabular-nums;
+  }
+  .stat { padding: 4px 10px; border-radius: 4px; background: #16213e; }
+  .stat-label { color: #777; }
+  .stat-value { color: #eee; font-weight: 600; }
+  .stat-good { color: #16c79a; }
+  .stat-warn { color: #f5a623; }
+  .stat-bad { color: #e94560; }
   #controls {
     display: flex; align-items: center; gap: 10px;
     margin-top: 10px; width: 100%;
@@ -265,6 +294,11 @@ HTML = """
     <div class="row">
       <input id="url-input" type="text" placeholder="Paste YouTube URL here...">
       <button id="go-btn" onclick="go()">Go</button>
+      <span style="color:#555;">or</span>
+      <label style="cursor:pointer;">
+        <button onclick="document.getElementById('vid-upload').click(); return false;">Upload</button>
+        <input id="vid-upload" type="file" accept="video/*" style="display:none;" onchange="uploadVideo(this)">
+      </label>
     </div>
 
     <div class="row">
@@ -281,8 +315,29 @@ HTML = """
           <option value="rtmpose_body">RTMPose Body</option>
           <option value="rtmpose_whole">RTMPose Wholebody (133 pts)</option>
           <option value="rtmpose_shadow">RTMPose Body Shadow</option>
+          <option value="rtmpose_costume">RTMPose Costume Transfer</option>
+        </optgroup>
+        <optgroup label="YOLO">
+          <option value="yolo_shadow">YOLO Shadow (per-person)</option>
+        </optgroup>
+        <optgroup label="Generative" id="gen-group" style="display:none;">
+          <option value="controlnet">ControlNet Pose (SD 1.5)</option>
         </optgroup>
       </select>
+    </div>
+
+    <div class="row" id="prompt-row" style="display:none;">
+      <input id="prompt-input" type="text" placeholder="Describe the person..." value="person dancing, professional photo, studio lighting, high quality"
+        style="flex:1; padding:10px 14px; font-size:1rem; border:1px solid #333; border-radius:6px; background:#16213e; color:#eee; outline:none;">
+    </div>
+
+    <div class="row" id="ref-row" style="display:none;">
+      <label style="flex:1; display:flex; align-items:center; gap:8px; cursor:pointer;
+        padding:10px 14px; border:1px dashed #555; border-radius:6px; background:#16213e; color:#aaa;">
+        <span id="ref-label">Upload reference person image...</span>
+        <input id="ref-input" type="file" accept="image/*" style="display:none;" onchange="uploadRef(this)">
+      </label>
+      <img id="ref-preview" style="display:none; height:48px; border-radius:4px;">
     </div>
 
     <div id="status"></div>
@@ -293,6 +348,12 @@ HTML = """
         <button id="play-btn" onclick="togglePlay()">&#9654;</button>
         <input id="slider" type="range" min="0" max="1000" value="0">
         <span id="time-display">0:00 / 0:00</span>
+      </div>
+      <div id="stats">
+        <div class="stat"><span class="stat-label">Process: </span><span class="stat-value" id="stat-proc">—</span></div>
+        <div class="stat"><span class="stat-label">Round-trip: </span><span class="stat-value" id="stat-rtt">—</span></div>
+        <div class="stat"><span class="stat-label">FPS: </span><span class="stat-value" id="stat-fps">—</span></div>
+        <div class="stat"><span class="stat-label">Status: </span><span class="stat-value" id="stat-status">—</span></div>
       </div>
     </div>
   </div>
@@ -322,8 +383,44 @@ function fmtTime(s) {
   return m + ':' + String(sec).padStart(2, '0');
 }
 
+let refUploaded = false;
+
 function getMode() {
-  return document.getElementById('mode-select').value;
+  const mode = document.getElementById('mode-select').value;
+  document.getElementById('ref-row').style.display =
+    (mode === 'rtmpose_costume') ? 'flex' : 'none';
+  document.getElementById('prompt-row').style.display =
+    (mode === 'controlnet') ? 'flex' : 'none';
+  return mode;
+}
+
+// Check if controlnet is available and show the option group
+fetch('/modes').then(r => r.json()).then(modes => {
+  if (modes.includes('controlnet')) {
+    document.getElementById('gen-group').style.display = '';
+  }
+});
+
+async function uploadRef(input) {
+  if (!input.files[0]) return;
+  const formData = new FormData();
+  formData.append('image', input.files[0]);
+  document.getElementById('ref-label').textContent = 'Uploading...';
+  try {
+    const resp = await fetch('/upload_reference', { method: 'POST', body: formData });
+    const data = await resp.json();
+    if (data.error) {
+      document.getElementById('ref-label').textContent = 'Error: ' + data.error;
+      return;
+    }
+    document.getElementById('ref-label').textContent = data.filename + ' (' + data.parts + ')';
+    document.getElementById('ref-preview').src = '/reference_preview?' + Date.now();
+    document.getElementById('ref-preview').style.display = 'block';
+    refUploaded = true;
+    if (currentUrl) fetchFrame(currentTime);
+  } catch (e) {
+    document.getElementById('ref-label').textContent = 'Upload failed';
+  }
 }
 
 function pickVideo(url, card) {
@@ -331,6 +428,42 @@ function pickVideo(url, card) {
   document.querySelectorAll('.video-card').forEach(c => c.classList.remove('active'));
   if (card) card.classList.add('active');
   go();
+}
+
+async function uploadVideo(input) {
+  if (!input.files[0]) return;
+  const btn = document.getElementById('go-btn');
+  btn.disabled = true;
+  stop();
+  output.style.display = 'none';
+  statusEl.textContent = 'Uploading video (' + (input.files[0].size / 1e6).toFixed(1) + ' MB)...';
+
+  const formData = new FormData();
+  formData.append('video', input.files[0]);
+  try {
+    const resp = await fetch('/upload_video', { method: 'POST', body: formData });
+    const data = await resp.json();
+    if (data.error) {
+      statusEl.textContent = 'Error: ' + data.error;
+      btn.disabled = false;
+      return;
+    }
+    currentUrl = '__uploaded__';
+    duration = data.duration;
+    fps = data.fps;
+    currentTime = 0;
+    slider.value = 0;
+    updateTimeDisplay();
+    output.style.display = 'block';
+    getMode();
+    statusEl.textContent = 'Ready — press play';
+    btn.disabled = false;
+    fetchFrame(0);
+  } catch (e) {
+    statusEl.textContent = 'Upload failed: ' + e.message;
+    btn.disabled = false;
+  }
+  input.value = '';
 }
 
 async function go() {
@@ -377,24 +510,82 @@ async function go() {
   updateTimeDisplay();
   output.style.display = 'block';
   statusEl.textContent = 'Ready — press play';
+  getMode();
   btn.disabled = false;
 
   fetchFrame(0);
 }
 
+let lastFrameTime = 0;
+let fpsCount = 0;
+let fpsTimer = performance.now();
+let currentFps = 0;
+
 function fetchFrame(t) {
   if (pendingFrame) return;
   pendingFrame = true;
   const mode = getMode();
-  const newImg = new Image();
-  newImg.onload = () => {
-    img.src = newImg.src;
+  let frameUrl = '/frame/' + mode + '?t=' + t.toFixed(3) + '&_=' + Date.now();
+  if (mode === 'controlnet') {
+    frameUrl += '&prompt=' + encodeURIComponent(
+      document.getElementById('prompt-input').value.trim());
+  }
+
+  const rttStart = performance.now();
+
+  fetch(frameUrl).then(resp => {
+    const procMs = resp.headers.get('X-Process-Ms');
+    return resp.blob().then(blob => ({ blob, procMs }));
+  }).then(({ blob, procMs }) => {
+    const rttMs = Math.round(performance.now() - rttStart);
+    const url = URL.createObjectURL(blob);
+    img.src = url;
+
+    // Update stats
+    if (procMs) {
+      const pm = parseInt(procMs);
+      const procEl = document.getElementById('stat-proc');
+      procEl.textContent = pm + 'ms';
+      procEl.className = 'stat-value ' + (pm < 33 ? 'stat-good' : pm < 100 ? 'stat-warn' : 'stat-bad');
+    }
+
+    const rttEl = document.getElementById('stat-rtt');
+    rttEl.textContent = rttMs + 'ms';
+    rttEl.className = 'stat-value ' + (rttMs < 50 ? 'stat-good' : rttMs < 150 ? 'stat-warn' : 'stat-bad');
+
+    // FPS calculation
+    fpsCount++;
+    const now = performance.now();
+    if (now - fpsTimer >= 1000) {
+      currentFps = fpsCount;
+      fpsCount = 0;
+      fpsTimer = now;
+    }
+    const fpsEl = document.getElementById('stat-fps');
+    fpsEl.textContent = currentFps || '...';
+    fpsEl.className = 'stat-value ' + (currentFps >= 24 ? 'stat-good' : currentFps >= 10 ? 'stat-warn' : 'stat-bad');
+
+    // Real-time status
+    const statusEl2 = document.getElementById('stat-status');
+    const videoFps = fps || 30;
+    if (currentFps >= videoFps * 0.9) {
+      statusEl2.textContent = 'Real-time';
+      statusEl2.className = 'stat-value stat-good';
+    } else if (currentFps >= videoFps * 0.5) {
+      statusEl2.textContent = 'Slight lag';
+      statusEl2.className = 'stat-value stat-warn';
+    } else if (currentFps > 0) {
+      statusEl2.textContent = 'Lagging (' + Math.round(currentFps/videoFps*100) + '% speed)';
+      statusEl2.className = 'stat-value stat-bad';
+    } else {
+      statusEl2.textContent = '—';
+      statusEl2.className = 'stat-value';
+    }
+
     pendingFrame = false;
-  };
-  newImg.onerror = () => {
+  }).catch(() => {
     pendingFrame = false;
-  };
-  newImg.src = '/frame/' + mode + '?t=' + t.toFixed(3) + '&_=' + Date.now();
+  });
 }
 
 function updateTimeDisplay() {
@@ -474,6 +665,11 @@ document.getElementById('mode-select').addEventListener('change', () => {
 """
 
 
+@app.route("/modes")
+def modes():
+    return jsonify(list(MODES.keys()))
+
+
 # ── Video download ───────────────────────────────────────────────────
 
 def download_video(url):
@@ -517,6 +713,71 @@ def download():
         "fps": current_video["fps"],
         "total_frames": current_video["total_frames"],
     })
+
+
+@app.route("/upload_video", methods=["POST"])
+def upload_video():
+    if 'video' not in request.files:
+        return jsonify({"error": "No video uploaded"})
+    f = request.files['video']
+    out_path = os.path.join(DOWNLOAD_DIR, "video.mp4")
+    f.save(out_path)
+    current_video["path"] = out_path
+    cap = cv2.VideoCapture(out_path)
+    current_video["fps"] = cap.get(cv2.CAP_PROP_FPS) or 30
+    current_video["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    current_video["duration"] = current_video["total_frames"] / current_video["fps"]
+    cap.release()
+    return jsonify({
+        "ok": True,
+        "duration": current_video["duration"],
+        "fps": current_video["fps"],
+        "total_frames": current_video["total_frames"],
+    })
+
+
+@app.route("/upload_reference", methods=["POST"])
+def upload_reference():
+    if 'image' not in request.files:
+        return jsonify({"error": "No image uploaded"})
+    f = request.files['image']
+    img_bytes = np.frombuffer(f.read(), np.uint8)
+    image = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
+    if image is None:
+        return jsonify({"error": "Could not decode image"})
+
+    ok, msg = process_reference_image(image)
+    if not ok:
+        return jsonify({"error": msg})
+    return jsonify({"ok": True, "filename": f.filename, "parts": msg})
+
+
+@app.route("/reference_preview")
+def reference_preview():
+    if _reference_data["image"] is None:
+        return "No reference", 404
+    # Draw the extracted parts overlay on the reference
+    vis = _reference_data["image"].copy()
+    kp = _reference_data["keypoints"]
+    sc = _reference_data["scores"]
+    body_scale = _get_body_scale(kp, sc)
+
+    # Draw skeleton
+    for a_name, b_name in [("r_sho","r_elb"),("r_elb","r_wri"),("l_sho","l_elb"),("l_elb","l_wri"),
+                            ("r_hip","r_kne"),("r_kne","r_ank"),("l_hip","l_kne"),("l_kne","l_ank"),
+                            ("r_sho","l_sho"),("r_hip","l_hip"),("r_sho","r_hip"),("l_sho","l_hip")]:
+        a = _pt(kp, sc, a_name)
+        b = _pt(kp, sc, b_name)
+        if a and b:
+            cv2.line(vis, a, b, (0, 255, 0), 2)
+
+    for name in _OP:
+        pt = _pt(kp, sc, name)
+        if pt:
+            cv2.circle(vis, pt, 4, (0, 0, 255), -1)
+
+    _, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return Response(buf.tobytes(), mimetype="image/jpeg")
 
 
 # ── Drawing helpers ──────────────────────────────────────────────────
@@ -614,6 +875,10 @@ def _create_processor(mode):
         return Wholebody(mode='lightweight', to_openpose=False, backend='onnxruntime')
     elif mode == "rtmpose_shadow":
         return Body(mode='lightweight', to_openpose=True, backend='onnxruntime')
+    elif mode == "rtmpose_costume":
+        return Body(mode='lightweight', to_openpose=True, backend='onnxruntime')
+    elif mode == "yolo_shadow":
+        return YOLO("yolov8n-seg.pt")
 
 
 # ── Body shadow drawing ─────────────────────────────────────────────
@@ -723,6 +988,252 @@ def draw_body_shadow(frame, keypoints, scores, color=(40, 30, 30)):
     for pt in [r_wri, l_wri, r_ank, l_ank]:
         if pt:
             cv2.circle(frame, pt, extremity_r, color, -1)
+
+
+# ── Costume transfer ─────────────────────────────────────────────────
+
+# Body part definitions: each part is defined by the keypoints that form its region
+# Using OpenPose COCO-18 indices
+BODY_PARTS = {
+    "head":       {"keypoints": ["nose", "r_eye", "l_eye", "r_ear", "l_ear"], "expand": 1.6},
+    "torso":      {"keypoints": ["r_sho", "l_sho", "l_hip", "r_hip"]},
+    "upper_torso":{"keypoints": ["neck", "r_sho", "l_sho"]},
+    "r_upper_arm":{"keypoints": ["r_sho", "r_elb"], "width_scale": 0.4},
+    "r_lower_arm":{"keypoints": ["r_elb", "r_wri"], "width_scale": 0.3},
+    "l_upper_arm":{"keypoints": ["l_sho", "l_elb"], "width_scale": 0.4},
+    "l_lower_arm":{"keypoints": ["l_elb", "l_wri"], "width_scale": 0.3},
+    "r_upper_leg":{"keypoints": ["r_hip", "r_kne"], "width_scale": 0.45},
+    "r_lower_leg":{"keypoints": ["r_kne", "r_ank"], "width_scale": 0.35},
+    "l_upper_leg":{"keypoints": ["l_hip", "l_kne"], "width_scale": 0.45},
+    "l_lower_leg":{"keypoints": ["l_kne", "l_ank"], "width_scale": 0.35},
+}
+
+# Reference image data (populated on upload)
+_reference_data = {
+    "image": None,         # original image (BGR)
+    "mask": None,          # person segmentation mask
+    "keypoints": None,     # (N, 2) array
+    "scores": None,        # (N,) array
+    "points": None,        # control points for triangulation
+    "indices": None,       # which keypoint index each point maps to
+    "triangles": None,     # Delaunay triangle index triples
+}
+
+
+def _get_body_scale(kp, sc):
+    r_sho = _pt(kp, sc, "r_sho")
+    l_sho = _pt(kp, sc, "l_sho")
+    if r_sho and l_sho:
+        return max(20, int(((r_sho[0]-l_sho[0])**2 + (r_sho[1]-l_sho[1])**2)**0.5))
+    return 60
+
+
+def _segment_person(image):
+    """Use MediaPipe to segment the person from the background."""
+    seg_options = ImageSegmenterOptions(
+        base_options=BaseOptions(
+            model_asset_path=os.path.join(BASE_DIR, "selfie_multiclass.tflite")
+        ),
+        running_mode=mp.tasks.vision.RunningMode.IMAGE,
+        output_category_mask=True,
+        output_confidence_masks=False,
+    )
+    segmenter = ImageSegmenter.create_from_options(seg_options)
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = segmenter.segment(mp_image)
+    segmenter.close()
+
+    mask = np.squeeze(result.category_mask.numpy_view())
+    return (mask > 0).astype(np.uint8) * 255
+
+
+def _collect_control_points(kp, sc, h, w):
+    """Collect valid keypoints + boundary points for triangulation."""
+    points = []
+    indices = []  # which _OP index each point came from (-1 for boundary)
+
+    for name, idx in _OP.items():
+        pt = _pt(kp, sc, name)
+        if pt is not None:
+            points.append([float(pt[0]), float(pt[1])])
+            indices.append(idx)
+
+    # Add corner and edge points so triangulation covers the whole image
+    boundary = [
+        [0, 0], [w//2, 0], [w-1, 0],
+        [0, h//2], [w-1, h//2],
+        [0, h-1], [w//2, h-1], [w-1, h-1],
+    ]
+    for bp in boundary:
+        points.append(bp)
+        indices.append(-1)
+
+    return np.float32(points), indices
+
+
+def _triangulate(points, w, h):
+    """Compute Delaunay triangulation, return list of index triples."""
+    rect = (0, 0, w, h)
+    subdiv = cv2.Subdiv2D(rect)
+    for pt in points:
+        x, y = float(pt[0]), float(pt[1])
+        # Clamp to rect
+        x = max(0, min(w - 1, x))
+        y = max(0, min(h - 1, y))
+        subdiv.insert((x, y))
+
+    tri_list = subdiv.getTriangleList()
+    triangles = []
+
+    for t in tri_list:
+        pts_tri = [(t[0], t[1]), (t[2], t[3]), (t[4], t[5])]
+        idx = []
+        for pt in pts_tri:
+            # Find matching point index
+            dists = np.sum((points - np.array(pt)) ** 2, axis=1)
+            idx.append(int(np.argmin(dists)))
+        # Skip degenerate triangles
+        if len(set(idx)) == 3:
+            triangles.append(tuple(idx))
+
+    return triangles
+
+
+def _warp_triangle(src_img, src_mask, dst_img, src_tri, dst_tri):
+    """Warp a single triangle from src to dst using affine transform."""
+    src_tri = np.float32(src_tri)
+    dst_tri = np.float32(dst_tri)
+
+    # Bounding rects
+    sr = cv2.boundingRect(src_tri)
+    dr = cv2.boundingRect(dst_tri)
+
+    # Clip to image bounds
+    sh, sw = src_img.shape[:2]
+    dh, dw = dst_img.shape[:2]
+
+    sr = (max(0, sr[0]), max(0, sr[1]),
+          min(sw - max(0, sr[0]), sr[2]), min(sh - max(0, sr[1]), sr[3]))
+    dr = (max(0, dr[0]), max(0, dr[1]),
+          min(dw - max(0, dr[0]), dr[2]), min(dh - max(0, dr[1]), dr[3]))
+
+    if sr[2] <= 0 or sr[3] <= 0 or dr[2] <= 0 or dr[3] <= 0:
+        return
+
+    # Offset triangles to their bounding rects
+    src_tri_rect = [(p[0] - sr[0], p[1] - sr[1]) for p in src_tri]
+    dst_tri_rect = [(p[0] - dr[0], p[1] - dr[1]) for p in dst_tri]
+
+    # Crop source
+    src_crop = src_img[sr[1]:sr[1]+sr[3], sr[0]:sr[0]+sr[2]]
+    mask_crop = src_mask[sr[1]:sr[1]+sr[3], sr[0]:sr[0]+sr[2]]
+
+    if src_crop.size == 0:
+        return
+
+    # Affine transform
+    M = cv2.getAffineTransform(np.float32(src_tri_rect), np.float32(dst_tri_rect))
+    warped = cv2.warpAffine(src_crop, M, (dr[2], dr[3]),
+                            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+    warped_mask = cv2.warpAffine(mask_crop, M, (dr[2], dr[3]),
+                                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+
+    # Create triangle mask in destination rect
+    tri_mask = np.zeros((dr[3], dr[2]), dtype=np.uint8)
+    cv2.fillConvexPoly(tri_mask, np.int32(dst_tri_rect), 255)
+
+    # Combine: only pixels inside triangle AND person mask
+    combined_mask = cv2.bitwise_and(tri_mask, warped_mask)
+    alpha = combined_mask.astype(np.float32)[:, :, None] / 255.0
+
+    # Blend into destination
+    roi = dst_img[dr[1]:dr[1]+dr[3], dr[0]:dr[0]+dr[2]]
+    if roi.shape[:2] == warped.shape[:2]:
+        dst_img[dr[1]:dr[1]+dr[3], dr[0]:dr[0]+dr[2]] = \
+            (roi * (1 - alpha) + warped * alpha).astype(np.uint8)
+
+
+def process_reference_image(image):
+    """Process uploaded reference: segment person, detect pose, build triangulation."""
+    body_detector = Body(mode='lightweight', to_openpose=True, backend='onnxruntime')
+    keypoints, scores = body_detector(image)
+
+    if keypoints is None or len(keypoints) == 0:
+        return False, "No person detected in reference image"
+
+    kp, sc = keypoints[0], scores[0]
+    h, w = image.shape[:2]
+
+    # Segment person from background
+    person_mask = _segment_person(image)
+
+    # Collect control points and triangulate
+    points, indices = _collect_control_points(kp, sc, h, w)
+    triangles = _triangulate(points, w, h)
+
+    _reference_data["image"] = image
+    _reference_data["mask"] = person_mask
+    _reference_data["keypoints"] = kp
+    _reference_data["scores"] = sc
+    _reference_data["points"] = points
+    _reference_data["indices"] = indices
+    _reference_data["triangles"] = triangles
+
+    n_body = sum(1 for i in indices if i >= 0)
+    return True, f"{n_body} keypoints, {len(triangles)} triangles"
+
+
+def render_costume(frame, keypoints, scores):
+    """Render reference image warped to match detected pose via triangulation."""
+    if "triangles" not in _reference_data or not _reference_data["triangles"]:
+        return frame.copy()
+
+    h, w = frame.shape[:2]
+    canvas = np.full((h, w, 3), (220, 220, 230), dtype=np.uint8)
+
+    src_img = _reference_data["image"]
+    src_mask = _reference_data["mask"]
+    src_points = _reference_data["points"]
+    indices = _reference_data["indices"]
+    triangles = _reference_data["triangles"]
+
+    kp, sc = keypoints, scores
+
+    # Build destination points: map each source point to its target location
+    dst_points = []
+    for i, idx in enumerate(indices):
+        if idx >= 0:
+            # This is a body keypoint — find its position in the target
+            name = [n for n, v in _OP.items() if v == idx][0]
+            pt = _pt(kp, sc, name)
+            if pt is not None:
+                dst_points.append([float(pt[0]), float(pt[1])])
+            else:
+                # Keypoint not visible in target — keep source position scaled
+                dst_points.append([float(src_points[i][0]), float(src_points[i][1])])
+        else:
+            # Boundary point — scale to target dimensions
+            src_h, src_w = src_img.shape[:2]
+            dst_points.append([
+                src_points[i][0] / max(1, src_w - 1) * (w - 1),
+                src_points[i][1] / max(1, src_h - 1) * (h - 1),
+            ])
+
+    dst_points = np.float32(dst_points)
+
+    # Warp each triangle
+    for tri_idx in triangles:
+        i0, i1, i2 = tri_idx
+        src_tri = [src_points[i0], src_points[i1], src_points[i2]]
+        dst_tri = [dst_points[i0], dst_points[i1], dst_points[i2]]
+
+        try:
+            _warp_triangle(src_img, src_mask, canvas, src_tri, dst_tri)
+        except Exception:
+            continue
+
+    return canvas
 
 
 # ── Frame processing ─────────────────────────────────────────────────
@@ -836,6 +1347,45 @@ def process_frame(mode, processor, frame, mp_image):
             out = cv2.GaussianBlur(out, (5, 5), 0)
         return out
 
+    elif mode == "rtmpose_costume":
+        keypoints, scores = processor(frame)
+        if keypoints is not None and len(keypoints) > 0 and _reference_data.get("triangles"):
+            out = render_costume(frame, keypoints[0], scores[0])
+            return out
+        elif keypoints is not None and len(keypoints) > 0:
+            # No reference uploaded, fall back to shadow
+            h, w = frame.shape[:2]
+            out = np.full((h, w, 3), (220, 220, 230), dtype=np.uint8)
+            for i in range(len(keypoints)):
+                draw_body_shadow(out, keypoints[i], scores[i], color=(40, 30, 30))
+            return out
+        return frame.copy()
+
+    elif mode == "yolo_shadow":
+        h, w = frame.shape[:2]
+        results = processor(frame, classes=[0], verbose=False)
+        r = results[0]
+
+        out = np.full((h, w, 3), (220, 220, 230), dtype=np.uint8)
+
+        if r.masks is not None:
+            shadow_colors = [
+                (40, 30, 30), (30, 40, 60), (50, 25, 25),
+                (25, 35, 50), (45, 30, 40), (30, 30, 50),
+            ]
+            for i, mask_tensor in enumerate(r.masks.data):
+                mask = mask_tensor.cpu().numpy()
+                # Resize mask to frame dimensions
+                if mask.shape != (h, w):
+                    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+                color = shadow_colors[i % len(shadow_colors)]
+                person_mask = (mask > 0.5)
+                out[person_mask] = color
+
+            out = cv2.GaussianBlur(out, (5, 5), 0)
+
+        return out
+
     return frame.copy()
 
 
@@ -863,19 +1413,32 @@ def frame(mode):
         return "Frame not found", 404
 
     try:
-        processor = get_processor(mode)
-        is_rtm = mode.startswith("rtmpose")
+        t_start = time.time()
 
-        if is_rtm:
-            out = process_frame(mode, processor, raw_frame, None)
+        if mode == "controlnet" and _HAS_CUDA:
+            prompt = request.args.get("prompt", "person dancing, professional photo")
+            out = controlnet_generate(raw_frame, prompt=prompt)
         else:
-            rgb = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            out = process_frame(mode, processor, raw_frame, mp_image)
+            processor = get_processor(mode)
+            is_rtm = mode.startswith("rtmpose")
+            is_yolo = mode.startswith("yolo")
+
+            if is_rtm or is_yolo:
+                out = process_frame(mode, processor, raw_frame, None)
+            else:
+                rgb = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                out = process_frame(mode, processor, raw_frame, mp_image)
+
+        proc_ms = (time.time() - t_start) * 1000
 
         _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return Response(buf.tobytes(), mimetype="image/jpeg",
-                        headers={"Cache-Control": "no-store"})
+                        headers={
+                            "Cache-Control": "no-store",
+                            "X-Process-Ms": str(int(proc_ms)),
+                            "Access-Control-Expose-Headers": "X-Process-Ms",
+                        })
     except Exception as e:
         print(f"[{mode}] Frame error: {e}")
         traceback.print_exc()
