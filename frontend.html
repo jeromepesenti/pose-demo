@@ -100,14 +100,6 @@
   #play-btn {
     padding: 8px 16px; font-size: 1.2rem; min-width: 44px;
   }
-  #slider {
-    flex: 1; height: 6px; cursor: pointer;
-    accent-color: #e94560;
-  }
-  #time-display {
-    font-size: 0.85rem; color: #aaa; min-width: 100px; text-align: right;
-    font-variant-numeric: tabular-nums;
-  }
 
   @media (max-width: 768px) {
     #layout { flex-direction: column; }
@@ -209,8 +201,6 @@
       <img id="frame-img">
       <div id="controls">
         <button id="play-btn" onclick="togglePlay()">&#9654;</button>
-        <input id="slider" type="range" min="0" max="1000" value="0">
-        <span id="time-display">0:00 / 0:00</span>
       </div>
       <div id="stats">
         <div class="stat"><span class="stat-label">Process: </span><span class="stat-value" id="stat-proc">—</span></div>
@@ -224,464 +214,28 @@
 </div>
 
 <script>
-let currentUrl = '';
+/* ── Simplified player: always streams from beginning ── */
+
 let playing = false;
-let duration = 0;
-let fps = 30;
-let currentTime = 0;
-let pendingFrame = false;
-let rafId = null;
-let seeking = false;
+let statsInterval = null;
+let backendDirectUrl = '';
+let videoReady = false;
 
 const img = document.getElementById('frame-img');
-const slider = document.getElementById('slider');
 const playBtn = document.getElementById('play-btn');
-const timeDisplay = document.getElementById('time-display');
 const statusEl = document.getElementById('status');
 const output = document.getElementById('output');
 
-function fmtTime(s) {
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return m + ':' + String(sec).padStart(2, '0');
-}
-
-let refUploaded = false;
-
 function getMode() {
   const mode = document.getElementById('mode-select').value;
-  document.getElementById('ref-row').style.display =
-    (mode === 'rtmpose_costume') ? 'flex' : 'none';
-  document.getElementById('prompt-row').style.display =
-    mode.startsWith('controlnet') ? 'flex' : 'none';
+  const refRow = document.getElementById('ref-row');
+  const promptRow = document.getElementById('prompt-row');
+  if (refRow) refRow.style.display = (mode === 'rtmpose_costume') ? 'flex' : 'none';
+  if (promptRow) promptRow.style.display = mode.startsWith('controlnet') ? 'flex' : 'none';
   return mode;
 }
 
-// Check if controlnet is available and show the option group
-fetch('/modes').then(r => r.json()).then(modes => {
-  if (modes.includes('controlnet')) {
-    document.getElementById('gen-group').style.display = '';
-  }
-});
-
-// Load saved videos into sidebar
-function loadVideoList() {
-  fetch('/videos').then(r => r.json()).then(videos => {
-    const list = document.getElementById('video-list');
-    const noVids = document.getElementById('no-videos');
-    list.innerHTML = '';
-    if (videos.length === 0) {
-      noVids.style.display = 'block';
-      return;
-    }
-    noVids.style.display = 'none';
-    videos.forEach(v => {
-      const card = document.createElement('div');
-      card.className = 'video-card';
-      card.dataset.videoId = v.id;
-      card.onclick = () => pickSavedVideo(v.id, card);
-      card.innerHTML = '<img src="/thumbnail/' + v.id + '" alt="' + v.name + '">'
-        + '<div class="card-title">' + v.name + '</div>';
-      list.appendChild(card);
-    });
-  });
-}
-
-async function pickSavedVideo(videoId, card) {
-  document.querySelectorAll('.video-card').forEach(c => c.classList.remove('active'));
-  if (card) card.classList.add('active');
-  const btn = document.getElementById('go-btn');
-  btn.disabled = true;
-  stop();
-  output.style.display = 'none';
-  statusEl.textContent = 'Loading video...';
-
-  try {
-    const resp = await fetch('/load_video/' + videoId);
-    const data = await resp.json();
-    if (data.error) {
-      statusEl.textContent = 'Error: ' + data.error;
-      btn.disabled = false;
-      return;
-    }
-    currentUrl = '__saved_' + videoId;
-    duration = data.duration;
-    fps = data.fps;
-    currentTime = 0;
-    slider.value = 0;
-    updateTimeDisplay();
-    output.style.display = 'block';
-    getMode();
-    statusEl.textContent = 'Ready — press play';
-    btn.disabled = false;
-    fetchFrame(0);
-  } catch (e) {
-    statusEl.textContent = 'Error: ' + e.message;
-    btn.disabled = false;
-  }
-}
-
-// Dynamically load available modes from backend
-fetch('/modes').then(r => r.json()).then(modes => {
-  const select = document.getElementById('mode-select');
-  // Show generative group if controlnet available
-  if (modes.includes('controlnet')) {
-    document.getElementById('gen-group').style.display = '';
-  }
-  // Show detectron2 group if available
-  const d2group = document.getElementById('d2-group');
-  if (d2group && modes.some(m => m.startsWith('d2_'))) {
-    d2group.style.display = '';
-  }
-});
-
-loadVideoList();
-
-// Check backend status
-function refreshBackendStatus() {
-  fetch('/backend_status').then(r => r.json()).then(s => {
-    const el = document.getElementById('backend-info');
-    if (s.available) {
-      const url = s.url || 'unknown';
-      const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
-      const label = isLocal ? 'local machine' : url.replace('http://', '').replace(':5005', '');
-      el.innerHTML = '<span style="color:#16c79a;">&#9679;</span> Backend: <strong>' + label + '</strong>'
-        + (s.cuda ? ' <span style="color:#16c79a;">(CUDA GPU)</span>' : ' <span style="color:#f5a623;">(CPU)</span>');
-    } else {
-      el.innerHTML = '<span style="color:#e94560;">&#9679;</span> Backend offline';
-    }
-    document.getElementById('backend-url-input').value = s.url || '';
-  });
-}
-
-function toggleBackendInput() {
-  const row = document.getElementById('backend-input-row');
-  row.style.display = row.style.display === 'none' ? 'flex' : 'none';
-}
-
-function setBackend() {
-  const url = document.getElementById('backend-url-input').value.trim();
-  if (!url) return;
-  fetch('/set_backend', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({url})
-  }).then(r => r.json()).then(data => {
-    document.getElementById('backend-input-row').style.display = 'none';
-    refreshBackendStatus();
-  });
-}
-
-refreshBackendStatus();
-
-async function uploadRef(input) {
-  if (!input.files[0]) return;
-  const formData = new FormData();
-  formData.append('image', input.files[0]);
-  document.getElementById('ref-label').textContent = 'Uploading...';
-  try {
-    const resp = await fetch('/upload_reference', { method: 'POST', body: formData });
-    const data = await resp.json();
-    if (data.error) {
-      document.getElementById('ref-label').textContent = 'Error: ' + data.error;
-      return;
-    }
-    document.getElementById('ref-label').textContent = data.filename + ' (' + data.parts + ')';
-    document.getElementById('ref-preview').src = '/reference_preview?' + Date.now();
-    document.getElementById('ref-preview').style.display = 'block';
-    refUploaded = true;
-    if (currentUrl) fetchFrame(currentTime);
-  } catch (e) {
-    document.getElementById('ref-label').textContent = 'Upload failed';
-  }
-}
-
-function pickVideo(url, card) {
-  document.getElementById('url-input').value = url;
-  document.querySelectorAll('.video-card').forEach(c => c.classList.remove('active'));
-  if (card) card.classList.add('active');
-  go();
-}
-
-async function uploadVideo(input) {
-  if (!input.files[0]) return;
-  const btn = document.getElementById('go-btn');
-  btn.disabled = true;
-  stop();
-  output.style.display = 'none';
-  statusEl.textContent = 'Uploading video (' + (input.files[0].size / 1e6).toFixed(1) + ' MB)...';
-
-  const formData = new FormData();
-  formData.append('video', input.files[0]);
-  try {
-    const resp = await fetch('/upload_video', { method: 'POST', body: formData });
-    const data = await resp.json();
-    if (data.error) {
-      statusEl.textContent = 'Error: ' + data.error;
-      btn.disabled = false;
-      return;
-    }
-    currentUrl = '__uploaded__';
-    duration = data.duration;
-    fps = data.fps;
-    currentTime = 0;
-    slider.value = 0;
-    updateTimeDisplay();
-    output.style.display = 'block';
-    getMode();
-    statusEl.textContent = 'Ready — press play';
-    btn.disabled = false;
-    fetchFrame(0);
-    // Dynamically load available modes from backend
-fetch('/modes').then(r => r.json()).then(modes => {
-  const select = document.getElementById('mode-select');
-  // Show generative group if controlnet available
-  if (modes.includes('controlnet')) {
-    document.getElementById('gen-group').style.display = '';
-  }
-  // Show detectron2 group if available
-  const d2group = document.getElementById('d2-group');
-  if (d2group && modes.some(m => m.startsWith('d2_'))) {
-    d2group.style.display = '';
-  }
-});
-
-loadVideoList();
-
-// Check backend status
-function refreshBackendStatus() {
-  fetch('/backend_status').then(r => r.json()).then(s => {
-    const el = document.getElementById('backend-info');
-    if (s.available) {
-      const url = s.url || 'unknown';
-      const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
-      const label = isLocal ? 'local machine' : url.replace('http://', '').replace(':5005', '');
-      el.innerHTML = '<span style="color:#16c79a;">&#9679;</span> Backend: <strong>' + label + '</strong>'
-        + (s.cuda ? ' <span style="color:#16c79a;">(CUDA GPU)</span>' : ' <span style="color:#f5a623;">(CPU)</span>');
-    } else {
-      el.innerHTML = '<span style="color:#e94560;">&#9679;</span> Backend offline';
-    }
-    document.getElementById('backend-url-input').value = s.url || '';
-  });
-}
-
-function toggleBackendInput() {
-  const row = document.getElementById('backend-input-row');
-  row.style.display = row.style.display === 'none' ? 'flex' : 'none';
-}
-
-function setBackend() {
-  const url = document.getElementById('backend-url-input').value.trim();
-  if (!url) return;
-  fetch('/set_backend', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({url})
-  }).then(r => r.json()).then(data => {
-    document.getElementById('backend-input-row').style.display = 'none';
-    refreshBackendStatus();
-  });
-}
-
-refreshBackendStatus();
-  } catch (e) {
-    statusEl.textContent = 'Upload failed: ' + e.message;
-    btn.disabled = false;
-  }
-  input.value = '';
-}
-
-async function go() {
-  const url = document.getElementById('url-input').value.trim();
-  if (!url) return;
-  const btn = document.getElementById('go-btn');
-  btn.disabled = true;
-  stop();
-  output.style.display = 'none';
-
-  // Highlight matching sidebar card
-  document.querySelectorAll('.video-card').forEach(c => {
-    const onclick = c.getAttribute('onclick') || '';
-    if (onclick.includes(url)) c.classList.add('active');
-    else c.classList.remove('active');
-  });
-
-  if (url !== currentUrl) {
-    statusEl.textContent = 'Downloading video...';
-    try {
-      const resp = await fetch('/download', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({url})
-      });
-      const data = await resp.json();
-      if (data.error) {
-        statusEl.textContent = 'Error: ' + data.error;
-        btn.disabled = false;
-        return;
-      }
-      currentUrl = url;
-      duration = data.duration;
-      fps = data.fps;
-      // Dynamically load available modes from backend
-fetch('/modes').then(r => r.json()).then(modes => {
-  const select = document.getElementById('mode-select');
-  // Show generative group if controlnet available
-  if (modes.includes('controlnet')) {
-    document.getElementById('gen-group').style.display = '';
-  }
-  // Show detectron2 group if available
-  const d2group = document.getElementById('d2-group');
-  if (d2group && modes.some(m => m.startsWith('d2_'))) {
-    d2group.style.display = '';
-  }
-});
-
-loadVideoList();
-
-// Check backend status
-function refreshBackendStatus() {
-  fetch('/backend_status').then(r => r.json()).then(s => {
-    const el = document.getElementById('backend-info');
-    if (s.available) {
-      const url = s.url || 'unknown';
-      const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
-      const label = isLocal ? 'local machine' : url.replace('http://', '').replace(':5005', '');
-      el.innerHTML = '<span style="color:#16c79a;">&#9679;</span> Backend: <strong>' + label + '</strong>'
-        + (s.cuda ? ' <span style="color:#16c79a;">(CUDA GPU)</span>' : ' <span style="color:#f5a623;">(CPU)</span>');
-    } else {
-      el.innerHTML = '<span style="color:#e94560;">&#9679;</span> Backend offline';
-    }
-    document.getElementById('backend-url-input').value = s.url || '';
-  });
-}
-
-function toggleBackendInput() {
-  const row = document.getElementById('backend-input-row');
-  row.style.display = row.style.display === 'none' ? 'flex' : 'none';
-}
-
-function setBackend() {
-  const url = document.getElementById('backend-url-input').value.trim();
-  if (!url) return;
-  fetch('/set_backend', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({url})
-  }).then(r => r.json()).then(data => {
-    document.getElementById('backend-input-row').style.display = 'none';
-    refreshBackendStatus();
-  });
-}
-
-refreshBackendStatus();
-    } catch (e) {
-      statusEl.textContent = 'Error: ' + e.message;
-      btn.disabled = false;
-      return;
-    }
-  }
-
-  currentTime = 0;
-  slider.value = 0;
-  updateTimeDisplay();
-  output.style.display = 'block';
-  statusEl.textContent = 'Ready — press play';
-  getMode();
-  btn.disabled = false;
-
-  fetchFrame(0);
-}
-
-let lastFrameTime = 0;
-let fpsCount = 0;
-let fpsTimer = performance.now();
-let currentFps = 0;
-
-function fetchFrame(t) {
-  if (pendingFrame) return;
-  pendingFrame = true;
-  const mode = getMode();
-  let frameUrl = '/frame/' + mode + '?t=' + t.toFixed(3) + '&_=' + Date.now();
-  if (mode.startsWith('controlnet')) {
-    frameUrl += '&prompt=' + encodeURIComponent(
-      document.getElementById('prompt-input').value.trim());
-  }
-
-  const rttStart = performance.now();
-
-  fetch(frameUrl).then(resp => {
-    const procMs = resp.headers.get('X-Process-Ms');
-    return resp.blob().then(blob => ({ blob, procMs }));
-  }).then(({ blob, procMs }) => {
-    const rttMs = Math.round(performance.now() - rttStart);
-    const url = URL.createObjectURL(blob);
-    img.src = url;
-
-    // Update stats
-    if (procMs) {
-      const pm = parseInt(procMs);
-      const procEl = document.getElementById('stat-proc');
-      procEl.textContent = pm + 'ms';
-      procEl.className = 'stat-value ' + (pm < 33 ? 'stat-good' : pm < 100 ? 'stat-warn' : 'stat-bad');
-    }
-
-    const rttEl = document.getElementById('stat-rtt');
-    rttEl.textContent = rttMs + 'ms';
-    rttEl.className = 'stat-value ' + (rttMs < 50 ? 'stat-good' : rttMs < 150 ? 'stat-warn' : 'stat-bad');
-
-    // FPS calculation
-    fpsCount++;
-    const now = performance.now();
-    if (now - fpsTimer >= 1000) {
-      currentFps = fpsCount;
-      fpsCount = 0;
-      fpsTimer = now;
-    }
-    const fpsEl = document.getElementById('stat-fps');
-    fpsEl.textContent = currentFps || '...';
-    fpsEl.className = 'stat-value ' + (currentFps >= 24 ? 'stat-good' : currentFps >= 10 ? 'stat-warn' : 'stat-bad');
-
-    // Real-time status
-    const statusEl2 = document.getElementById('stat-status');
-    const videoFps = fps || 30;
-    if (currentFps >= videoFps * 0.9) {
-      statusEl2.textContent = 'Real-time';
-      statusEl2.className = 'stat-value stat-good';
-    } else if (currentFps >= videoFps * 0.5) {
-      statusEl2.textContent = 'Slight lag';
-      statusEl2.className = 'stat-value stat-warn';
-    } else if (currentFps > 0) {
-      statusEl2.textContent = 'Lagging (' + Math.round(currentFps/videoFps*100) + '% speed)';
-      statusEl2.className = 'stat-value stat-bad';
-    } else {
-      statusEl2.textContent = '—';
-      statusEl2.className = 'stat-value';
-    }
-
-    pendingFrame = false;
-  }).catch(() => {
-    pendingFrame = false;
-  });
-}
-
-function updateTimeDisplay() {
-  timeDisplay.textContent = fmtTime(currentTime) + ' / ' + fmtTime(duration);
-}
-
-function togglePlay() {
-  if (playing) {
-    stop();
-  } else {
-    play();
-  }
-}
-
-let sliderInterval = null;
-let statsInterval = null;
-let backendDirectUrl = '';  // direct URL to backend for streaming
-
-// Fetch direct backend URL
+// ── Backend discovery ──
 function refreshDirectUrl() {
   fetch('/backend_direct_url').then(r => r.json()).then(d => {
     if (d.url && d.url.startsWith(':')) {
@@ -694,38 +248,156 @@ function refreshDirectUrl() {
 refreshDirectUrl();
 setInterval(refreshDirectUrl, 10000);
 
-function play() {
+function refreshBackendStatus() {
+  fetch('/backend_status').then(r => r.json()).then(s => {
+    const el = document.getElementById('backend-info');
+    if (s.available) {
+      const url = s.url || 'unknown';
+      const isLocal = url.includes('localhost') || url.includes('127.0.0.1');
+      const label = isLocal ? 'local machine' : url.replace('http://', '').replace(':5005', '');
+      el.innerHTML = '<span style="color:#16c79a;">&#9679;</span> Backend: <strong>' + label + '</strong>'
+        + (s.cuda ? ' <span style="color:#16c79a;">(CUDA GPU)</span>' : ' <span style="color:#f5a623;">(CPU)</span>');
+    } else {
+      el.innerHTML = '<span style="color:#e94560;">&#9679;</span> Backend offline';
+    }
+    document.getElementById('backend-url-input').value = s.url || '';
+  });
+}
+refreshBackendStatus();
+
+function toggleBackendInput() {
+  const row = document.getElementById('backend-input-row');
+  row.style.display = row.style.display === 'none' ? 'flex' : 'none';
+}
+
+function setBackend() {
+  const url = document.getElementById('backend-url-input').value.trim();
+  if (!url) return;
+  fetch('/set_backend', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url})
+  }).then(() => {
+    document.getElementById('backend-input-row').style.display = 'none';
+    refreshBackendStatus();
+    refreshDirectUrl();
+  });
+}
+
+// ── Video list ──
+function loadVideoList() {
+  fetch('/videos').then(r => r.json()).then(videos => {
+    const list = document.getElementById('video-list');
+    const noVids = document.getElementById('no-videos');
+    list.innerHTML = '';
+    if (videos.length === 0) { noVids.style.display = 'block'; return; }
+    noVids.style.display = 'none';
+    videos.forEach(v => {
+      const card = document.createElement('div');
+      card.className = 'video-card';
+      card.onclick = () => loadVideo(v.id, v.name, card);
+      card.innerHTML = '<img src="/thumbnail/' + v.id + '"><div class="card-title">' + v.name + '</div>';
+      list.appendChild(card);
+    });
+  });
+}
+loadVideoList();
+
+// ── Load a video ──
+async function loadVideo(videoId, name, card) {
+  stop();
+  document.querySelectorAll('.video-card').forEach(c => c.classList.remove('active'));
+  if (card) card.classList.add('active');
+  statusEl.textContent = 'Loading ' + (name || 'video') + '...';
+  output.style.display = 'none';
+
+  try {
+    const resp = await fetch('/load_video/' + videoId);
+    const data = await resp.json();
+    if (data.error) { statusEl.textContent = 'Error: ' + data.error; return; }
+    videoReady = true;
+    output.style.display = 'block';
+    getMode();
+    statusEl.textContent = 'Ready — press play';
+    startStream();
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + e.message;
+  }
+}
+
+// ── Upload video ──
+async function uploadVideo(input) {
+  if (!input.files[0]) return;
+  stop();
+  output.style.display = 'none';
+  statusEl.textContent = 'Uploading (' + (input.files[0].size / 1e6).toFixed(1) + ' MB)...';
+  const formData = new FormData();
+  formData.append('video', input.files[0]);
+  try {
+    const resp = await fetch('/upload_video', { method: 'POST', body: formData });
+    const data = await resp.json();
+    if (data.error) { statusEl.textContent = 'Error: ' + data.error; return; }
+    videoReady = true;
+    output.style.display = 'block';
+    getMode();
+    statusEl.textContent = 'Ready — press play';
+    loadVideoList();
+    startStream();
+  } catch (e) {
+    statusEl.textContent = 'Upload failed: ' + e.message;
+  }
+  input.value = '';
+}
+
+// ── YouTube download ──
+async function go() {
+  const url = document.getElementById('url-input').value.trim();
+  if (!url) return;
+  const btn = document.getElementById('go-btn');
+  btn.disabled = true;
+  stop();
+  output.style.display = 'none';
+  statusEl.textContent = 'Downloading video...';
+
+  try {
+    const resp = await fetch('/download', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url})
+    });
+    const data = await resp.json();
+    if (data.error) { statusEl.textContent = 'Error: ' + data.error; btn.disabled = false; return; }
+    videoReady = true;
+    output.style.display = 'block';
+    getMode();
+    statusEl.textContent = 'Ready — press play';
+    loadVideoList();
+    startStream();
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false;
+}
+
+// ── Streaming ──
+function startStream() {
+  if (!videoReady) return;
+  stop();
   playing = true;
   playBtn.innerHTML = '&#9646;&#9646;';
+  const mode = getMode();
   statusEl.textContent = 'Streaming — ' + document.getElementById('mode-select').selectedOptions[0].text;
 
-  // Use MJPEG stream — direct from backend if available (bypasses frontend proxy)
-  const mode = getMode();
   const base = backendDirectUrl || '';
-  let streamUrl = base + '/stream/' + mode + '?t=' + currentTime.toFixed(3);
+  let streamUrl = base + '/stream/' + mode + '?t=0';
   if (mode.startsWith('controlnet')) {
-    streamUrl += '&prompt=' + encodeURIComponent(
-      document.getElementById('prompt-input').value.trim());
+    const prompt = document.getElementById('prompt-input');
+    if (prompt) streamUrl += '&prompt=' + encodeURIComponent(prompt.value.trim());
   }
 
   img.src = streamUrl;
 
-  // Update slider based on elapsed time
-  const startTime = currentTime;
-  const startWall = performance.now();
-  sliderInterval = setInterval(() => {
-    if (!playing) return;
-    currentTime = startTime + (performance.now() - startWall) / 1000;
-    if (currentTime >= duration) {
-      currentTime = duration;
-      stop();
-      return;
-    }
-    slider.value = Math.round((currentTime / duration) * 1000);
-    updateTimeDisplay();
-  }, 100);
-
-  // Poll server for live stats during streaming
+  // Poll stats
   statsInterval = setInterval(() => {
     if (!playing) return;
     const statsBase = backendDirectUrl || '';
@@ -741,18 +413,10 @@ function play() {
       fpsEl.textContent = s.fps;
       fpsEl.className = 'stat-value ' + (s.fps >= 24 ? 'stat-good' : s.fps >= 10 ? 'stat-warn' : 'stat-bad');
 
-      const videoFps = fps || 30;
       const statusEl2 = document.getElementById('stat-status');
-      if (s.fps >= videoFps * 0.9) {
-        statusEl2.textContent = 'Real-time';
-        statusEl2.className = 'stat-value stat-good';
-      } else if (s.fps >= videoFps * 0.5) {
-        statusEl2.textContent = 'Slight lag';
-        statusEl2.className = 'stat-value stat-warn';
-      } else if (s.fps > 0) {
-        statusEl2.textContent = 'Lagging (' + Math.round(s.fps/videoFps*100) + '%)';
-        statusEl2.className = 'stat-value stat-bad';
-      }
+      if (s.fps >= 20) { statusEl2.textContent = 'Real-time'; statusEl2.className = 'stat-value stat-good'; }
+      else if (s.fps >= 10) { statusEl2.textContent = 'Slight lag'; statusEl2.className = 'stat-value stat-warn'; }
+      else if (s.fps > 0) { statusEl2.textContent = 'Lagging'; statusEl2.className = 'stat-value stat-bad'; }
     }).catch(() => {});
   }, 500);
 }
@@ -760,43 +424,30 @@ function play() {
 function stop() {
   playing = false;
   playBtn.innerHTML = '&#9654;';
-  if (rafId) cancelAnimationFrame(rafId);
-  rafId = null;
-  if (sliderInterval) { clearInterval(sliderInterval); sliderInterval = null; }
   if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
-
-  // Switch from MJPEG stream back to single frame
-  if (img.src.includes('/stream/')) {
-    fetchFrame(currentTime);
-  }
-  if (statusEl.textContent.startsWith('Streaming') || statusEl.textContent.startsWith('Playing'))
-    statusEl.textContent = 'Paused';
+  img.src = '';
 }
 
-slider.addEventListener('input', () => {
-  seeking = true;
-  currentTime = (slider.value / 1000) * duration;
-  updateTimeDisplay();
-  fetchFrame(currentTime);
-});
+function togglePlay() {
+  if (playing) { stop(); statusEl.textContent = 'Paused'; }
+  else { startStream(); }
+}
 
-slider.addEventListener('change', () => {
-  seeking = false;
-  currentTime = (slider.value / 1000) * duration;
-  updateTimeDisplay();
-  fetchFrame(currentTime);
-});
-
+// ── Mode change: restart stream ──
 document.getElementById('mode-select').addEventListener('change', () => {
-  if (currentUrl) {
-    fetchFrame(currentTime);
-    if (playing) {
-      statusEl.textContent = 'Playing — ' + document.getElementById('mode-select').selectedOptions[0].text;
-    }
-  }
+  getMode();
+  if (videoReady && playing) startStream();
 });
 
-
+// ── Modes from backend ──
+fetch('/modes').then(r => r.json()).then(modes => {
+  if (modes.includes('controlnet')) {
+    const g = document.getElementById('gen-group');
+    if (g) g.style.display = '';
+  }
+  const d2 = document.getElementById('d2-group');
+  if (d2 && modes.some(m => m.startsWith('d2_'))) d2.style.display = '';
+});
 </script>
 </body>
 </html>
