@@ -54,7 +54,8 @@ python3 -c "from rtmlib import Body; Body(mode='lightweight', to_openpose=True, 
 if [ "${INSTALL_DETECTRON2:-1}" = "1" ]; then
     echo "[6/6] Installing Detectron2 + DensePose..."
     WHEEL_BASE="https://github.com/jeromepesenti/pose-demo/releases/download/v0.1-wheels"
-    curl -sL -o /tmp/detectron2.whl "${WHEEL_BASE}/detectron2-0.6-cp310-cp310-linux_x86_64.whl"
+    PY_VER=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
+    curl -sL -o /tmp/detectron2.whl "${WHEEL_BASE}/detectron2-0.6-${PY_VER}-${PY_VER}-linux_x86_64.whl"
     curl -sL -o /tmp/densepose.whl "${WHEEL_BASE}/detectron2_densepose-0.6-py3-none-any.whl"
     pip install --quiet --no-deps /tmp/detectron2.whl /tmp/densepose.whl
     pip install --quiet fvcore iopath pycocotools tabulate yacs omegaconf cloudpickle av opencv-python-headless pybind11
