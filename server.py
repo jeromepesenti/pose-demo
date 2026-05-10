@@ -29,6 +29,7 @@ except ImportError:
 
 if _HAS_CUDA:
     from controlnet_gpu import generate as controlnet_generate
+    from controlnet_gpu import generate_video_frame
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max upload
@@ -61,6 +62,7 @@ MODES = {
 
 if _HAS_CUDA:
     MODES["controlnet"] = {"label": "ControlNet Pose (SD 1.5)", "group": "Generative"}
+    MODES["controlnet_video"] = {"label": "AnimateDiff + ControlNet (video)", "group": "Generative"}
 
 # ── Connection definitions ───────────────────────────────────────────
 
@@ -322,6 +324,7 @@ HTML = """
         </optgroup>
         <optgroup label="Generative" id="gen-group" style="display:none;">
           <option value="controlnet">ControlNet Pose (SD 1.5)</option>
+          <option value="controlnet_video">AnimateDiff + ControlNet (video)</option>
         </optgroup>
       </select>
     </div>
@@ -390,7 +393,7 @@ function getMode() {
   document.getElementById('ref-row').style.display =
     (mode === 'rtmpose_costume') ? 'flex' : 'none';
   document.getElementById('prompt-row').style.display =
-    (mode === 'controlnet') ? 'flex' : 'none';
+    mode.startsWith('controlnet') ? 'flex' : 'none';
   return mode;
 }
 
@@ -526,7 +529,7 @@ function fetchFrame(t) {
   pendingFrame = true;
   const mode = getMode();
   let frameUrl = '/frame/' + mode + '?t=' + t.toFixed(3) + '&_=' + Date.now();
-  if (mode === 'controlnet') {
+  if (mode.startsWith('controlnet')) {
     frameUrl += '&prompt=' + encodeURIComponent(
       document.getElementById('prompt-input').value.trim());
   }
@@ -1415,7 +1418,12 @@ def frame(mode):
     try:
         t_start = time.time()
 
-        if mode == "controlnet" and _HAS_CUDA:
+        if mode == "controlnet_video" and _HAS_CUDA:
+            prompt = request.args.get("prompt", "person dancing, professional photo")
+            out = generate_video_frame(path, t, current_video["fps"], prompt)
+            if out is None:
+                out = raw_frame.copy()
+        elif mode == "controlnet" and _HAS_CUDA:
             prompt = request.args.get("prompt", "person dancing, professional photo")
             out = controlnet_generate(raw_frame, prompt=prompt)
         else:
