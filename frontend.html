@@ -149,14 +149,6 @@
 
     <div class="row">
       <select id="mode-select">
-        <optgroup label="MediaPipe">
-          <option value="pose">Pose Estimation (MediaPipe)</option>
-          <option value="shadow">Shadow Silhouette</option>
-          <option value="face_mesh">Face Mesh</option>
-          <option value="hands">Hand Tracking</option>
-          <option value="face_detect">Face Detection</option>
-          <option value="objects">Object Detection</option>
-        </optgroup>
         <optgroup label="RTMPose (MMPose)">
           <option value="rtmpose_body">RTMPose Body</option>
           <option value="rtmpose_whole">RTMPose Wholebody (133 pts)</option>
@@ -174,6 +166,14 @@
         <optgroup label="Generative" id="gen-group" style="display:none;">
           <option value="controlnet">ControlNet Pose (SD 1.5)</option>
           <option value="controlnet_video">AnimateDiff + ControlNet (video)</option>
+        </optgroup>
+        <optgroup label="MediaPipe">
+          <option value="pose">Pose Estimation (MediaPipe)</option>
+          <option value="shadow">Shadow Silhouette</option>
+          <option value="face_mesh">Face Mesh</option>
+          <option value="hands">Hand Tracking</option>
+          <option value="face_detect">Face Detection</option>
+          <option value="objects">Object Detection</option>
         </optgroup>
       </select>
     </div>

@@ -6,7 +6,7 @@ START=$(date +%s)
 # System deps
 echo "[1/5] System packages..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq libgl1-mesa-glx libglib2.0-0 unzip 2>/dev/null
+sudo apt-get install -y -qq libgl1-mesa-glx libglib2.0-0 libegl1 libgles2 unzip 2>/dev/null
 
 # Python deps (all pip wheels, no compilation)
 echo "[2/5] Python packages..."
