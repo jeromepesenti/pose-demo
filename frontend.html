@@ -142,8 +142,6 @@
     <div id="backend-status" style="font-size:0.75rem;margin-bottom:8px;display:flex;align-items:center;gap:8px;">
       <span id="backend-info"></span>
       <button id="backend-toggle" onclick="toggleBackendInput()" style="padding:2px 8px;font-size:0.7rem;background:#333;border:1px solid #555;color:#aaa;border-radius:4px;cursor:pointer;">change</button>
-      <button id="gpu-btn" style="display:none;padding:2px 8px;font-size:0.7rem;border:1px solid #555;border-radius:4px;cursor:pointer;" onclick="toggleGpu()">Start GPU</button>
-      <span id="gpu-status" style="font-size:0.7rem;color:#777;"></span>
     </div>
     <div id="backend-input-row" class="row" style="display:none;margin-bottom:8px;">
       <input id="backend-url-input" type="text" placeholder="http://gpu-ip:5005" style="flex:1;padding:6px 10px;font-size:0.85rem;border:1px solid #333;border-radius:6px;background:#16213e;color:#eee;outline:none;">
@@ -782,55 +780,7 @@ document.getElementById('mode-select').addEventListener('change', () => {
   }
 });
 
-// GPU on-demand controls
-function refreshGpuStatus() {
-  fetch('/gpu/status').then(r => r.json()).then(s => {
-    const btn = document.getElementById('gpu-btn');
-    const gStatus = document.getElementById('gpu-status');
-    if (!s.idle_timeout) { btn.style.display = 'none'; return; }
 
-    btn.style.display = '';
-    if (s.status === 'off') {
-      btn.textContent = 'Start GPU';
-      btn.style.background = '#16c79a'; btn.style.color = '#fff';
-      btn.disabled = false; gStatus.textContent = '';
-    } else if (s.status === 'starting' || s.status === 'setup') {
-      btn.textContent = 'Starting...';
-      btn.style.background = '#555'; btn.disabled = true;
-      gStatus.textContent = s.status === 'setup' ? 'installing deps...' : 'launching instance...';
-      gStatus.style.color = '#f5a623';
-      setTimeout(refreshGpuStatus, 3000);
-      setTimeout(refreshBackendStatus, 5000);
-    } else if (s.status === 'ready') {
-      btn.textContent = 'Stop GPU';
-      btn.style.background = '#e94560'; btn.style.color = '#fff';
-      btn.disabled = false;
-      const idle = Math.max(0, Math.round((s.idle_timeout - (Date.now()/1000 - s.last_activity)) / 60));
-      gStatus.textContent = 'auto-stop in ' + idle + 'min';
-      gStatus.style.color = '#777';
-      setTimeout(refreshGpuStatus, 30000);
-    } else if (s.status === 'stopping') {
-      btn.textContent = 'Stopping...';
-      btn.style.background = '#555'; btn.disabled = true;
-      gStatus.textContent = '';
-      setTimeout(refreshGpuStatus, 3000);
-      setTimeout(refreshBackendStatus, 2000);
-    }
-  }).catch(() => { document.getElementById('gpu-btn').style.display = 'none'; });
-}
-
-function toggleGpu() {
-  fetch('/gpu/status').then(r => r.json()).then(s => {
-    if (s.status === 'off') {
-      fetch('/gpu/start', { method: 'POST' });
-    } else if (s.status === 'ready') {
-      fetch('/gpu/stop', { method: 'POST' });
-    }
-    setTimeout(refreshGpuStatus, 1000);
-  });
-}
-
-refreshGpuStatus();
 </script>
 </body>
 </html>
