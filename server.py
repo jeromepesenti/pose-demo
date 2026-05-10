@@ -18,6 +18,7 @@ from mediapipe.tasks.python.vision import (
 )
 from rtmlib import Body, Wholebody
 from ultralytics import YOLO
+from detectron2_modes import process_keypoint, process_panoptic, process_densepose
 
 # ControlNet: only available with CUDA
 _HAS_CUDA = False
@@ -111,6 +112,9 @@ MODES = {
     "rtmpose_shadow":{"label": "RTMPose Body Shadow",            "group": "RTMPose (MMPose)"},
     "rtmpose_costume":{"label": "RTMPose Costume Transfer",      "group": "RTMPose (MMPose)"},
     "yolo_shadow":   {"label": "YOLO Shadow (per-person)",       "group": "YOLO"},
+    "d2_keypoint":   {"label": "Keypoint R-CNN (pose+mask)",     "group": "Detectron2"},
+    "d2_panoptic":   {"label": "Panoptic Segmentation",          "group": "Detectron2"},
+    "d2_densepose":  {"label": "DensePose (body surface)",       "group": "Detectron2"},
 }
 
 if _HAS_CUDA:
@@ -362,6 +366,11 @@ HTML = """
         </optgroup>
         <optgroup label="YOLO">
           <option value="yolo_shadow">YOLO Shadow (per-person)</option>
+        </optgroup>
+        <optgroup label="Detectron2">
+          <option value="d2_keypoint">Keypoint R-CNN (pose+mask)</option>
+          <option value="d2_panoptic">Panoptic Segmentation</option>
+          <option value="d2_densepose">DensePose (body surface)</option>
         </optgroup>
         <optgroup label="Generative" id="gen-group" style="display:none;">
           <option value="controlnet">ControlNet Pose (SD 1.5)</option>
@@ -1530,6 +1539,15 @@ def process_frame(mode, processor, frame, mp_image):
 
         return out
 
+    elif mode == "d2_keypoint":
+        return process_keypoint(frame)
+
+    elif mode == "d2_panoptic":
+        return process_panoptic(frame)
+
+    elif mode == "d2_densepose":
+        return process_densepose(frame)
+
     return frame.copy()
 
 
@@ -1571,8 +1589,9 @@ def frame(mode):
             processor = get_processor(mode)
             is_rtm = mode.startswith("rtmpose")
             is_yolo = mode.startswith("yolo")
+            is_d2 = mode.startswith("d2_")
 
-            if is_rtm or is_yolo:
+            if is_rtm or is_yolo or is_d2:
                 out = process_frame(mode, processor, raw_frame, None)
             else:
                 rgb = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
