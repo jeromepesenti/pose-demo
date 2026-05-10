@@ -679,15 +679,30 @@ function togglePlay() {
 
 let sliderInterval = null;
 let statsInterval = null;
+let backendDirectUrl = '';  // direct URL to backend for streaming
+
+// Fetch direct backend URL
+function refreshDirectUrl() {
+  fetch('/backend_direct_url').then(r => r.json()).then(d => {
+    if (d.url && d.url.startsWith(':')) {
+      backendDirectUrl = window.location.protocol + '//' + window.location.hostname + d.url;
+    } else {
+      backendDirectUrl = d.url || '';
+    }
+  }).catch(() => {});
+}
+refreshDirectUrl();
+setInterval(refreshDirectUrl, 10000);
 
 function play() {
   playing = true;
   playBtn.innerHTML = '&#9646;&#9646;';
   statusEl.textContent = 'Streaming — ' + document.getElementById('mode-select').selectedOptions[0].text;
 
-  // Use MJPEG stream for continuous playback (no per-frame round-trip)
+  // Use MJPEG stream — direct from backend if available (bypasses frontend proxy)
   const mode = getMode();
-  let streamUrl = '/stream/' + mode + '?t=' + currentTime.toFixed(3);
+  const base = backendDirectUrl || '';
+  let streamUrl = base + '/stream/' + mode + '?t=' + currentTime.toFixed(3);
   if (mode.startsWith('controlnet')) {
     streamUrl += '&prompt=' + encodeURIComponent(
       document.getElementById('prompt-input').value.trim());
@@ -713,7 +728,8 @@ function play() {
   // Poll server for live stats during streaming
   statsInterval = setInterval(() => {
     if (!playing) return;
-    fetch('/stream_stats').then(r => r.json()).then(s => {
+    const statsBase = backendDirectUrl || '';
+    fetch(statsBase + '/stream_stats').then(r => r.json()).then(s => {
       const procEl = document.getElementById('stat-proc');
       procEl.textContent = s.proc_ms + 'ms';
       procEl.className = 'stat-value ' + (s.proc_ms < 33 ? 'stat-good' : s.proc_ms < 100 ? 'stat-warn' : 'stat-bad');

@@ -346,6 +346,19 @@ def stream(mode):
 
 # ── Backend status ───────────────────────────────────────────────────
 
+@app.route("/backend_direct_url")
+def backend_direct_url():
+    """Return the URL the browser can use to reach the backend directly."""
+    # If GPU backend is on localhost via tunnel, expose via the frontend's public IP
+    if GPU_BACKEND_URL and "localhost" in GPU_BACKEND_URL:
+        # Browser can reach it via the same host on the tunneled port
+        port = GPU_BACKEND_URL.split(":")[-1]
+        return jsonify({"url": f":{port}"})  # relative to current host
+    elif GPU_BACKEND_URL:
+        return jsonify({"url": GPU_BACKEND_URL})
+    return jsonify({"url": ""})
+
+
 @app.route("/register_backend", methods=["POST"])
 def register_backend():
     """Called by a GPU backend to announce itself."""
