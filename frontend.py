@@ -23,8 +23,13 @@ os.makedirs(VIDEOS_DIR, exist_ok=True)
 
 YT_DLP = shutil.which("yt-dlp") or os.path.join(BASE_DIR, "venv", "bin", "yt-dlp")
 
-# GPU backend URL — set via env var or default to localhost
-BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:5005")
+# Backend URLs
+CPU_BACKEND_URL = "http://localhost:5005"  # always-on local CPU backend
+GPU_BACKEND_URL = None  # set when a GPU backend registers
+BACKEND_URL = os.environ.get("BACKEND_URL", CPU_BACKEND_URL)
+
+import threading as _threading
+_backend_lock = _threading.Lock()
 
 # Lambda Labs API for on-demand GPU
 LAMBDA_API_KEY = os.environ.get("LAMBDA_API_KEY", "")
@@ -40,8 +45,6 @@ _lambda_state = {
     "last_activity": 0,
     "idle_timeout": 900,   # 15 minutes
 }
-
-import threading as _threading
 
 def _lambda_api(method, endpoint, data=None):
     headers = {"Authorization": f"Bearer {LAMBDA_API_KEY}"}
@@ -226,6 +229,35 @@ def _idle_monitor():
 if LAMBDA_API_KEY:
     _idle_thread = _threading.Thread(target=_idle_monitor, daemon=True)
     _idle_thread.start()
+
+
+def _backend_health_check():
+    """Periodically check GPU backend. Fall back to CPU if GPU is down."""
+    global BACKEND_URL
+    import time as _t
+    while True:
+        _t.sleep(10)
+        with _backend_lock:
+            if GPU_BACKEND_URL and BACKEND_URL == GPU_BACKEND_URL:
+                try:
+                    r = http_requests.get(f"{GPU_BACKEND_URL}/", timeout=3)
+                    if r.status_code != 200:
+                        raise Exception(f"status {r.status_code}")
+                except Exception:
+                    print(f"[Backend] GPU backend offline, falling back to CPU")
+                    BACKEND_URL = CPU_BACKEND_URL
+            elif GPU_BACKEND_URL and BACKEND_URL == CPU_BACKEND_URL:
+                # GPU was registered but we fell back — check if it's back
+                try:
+                    r = http_requests.get(f"{GPU_BACKEND_URL}/", timeout=3)
+                    if r.status_code == 200:
+                        print(f"[Backend] GPU backend is back, switching to {GPU_BACKEND_URL}")
+                        BACKEND_URL = GPU_BACKEND_URL
+                except Exception:
+                    pass
+
+_health_thread = _threading.Thread(target=_backend_health_check, daemon=True)
+_health_thread.start()
 
 current_video = {"path": None, "fps": 30, "duration": 0, "total_frames": 0}
 
@@ -559,30 +591,58 @@ def gpu_stop():
     return jsonify({"ok": True, "status": "off"})
 
 
-@app.route("/set_backend", methods=["POST"])
-def set_backend():
-    global BACKEND_URL
+@app.route("/register_backend", methods=["POST"])
+def register_backend():
+    """Called by a GPU backend to announce itself."""
+    global BACKEND_URL, GPU_BACKEND_URL
     data = request.json
     url = data.get("url", "")
     if not url:
         return jsonify({"error": "No URL provided"})
-    BACKEND_URL = url
-    available = _backend_available()
-    return jsonify({"ok": True, "url": BACKEND_URL, "available": available})
+    with _backend_lock:
+        GPU_BACKEND_URL = url
+        BACKEND_URL = url
+    print(f"[Backend] GPU backend registered: {url}")
+    return jsonify({"ok": True, "url": BACKEND_URL})
+
+
+@app.route("/set_backend", methods=["POST"])
+def set_backend():
+    global BACKEND_URL, GPU_BACKEND_URL
+    data = request.json
+    url = data.get("url", "")
+    if not url:
+        return jsonify({"error": "No URL provided"})
+    with _backend_lock:
+        if url == CPU_BACKEND_URL:
+            GPU_BACKEND_URL = None
+        else:
+            GPU_BACKEND_URL = url
+        BACKEND_URL = url
+    return jsonify({"ok": True, "url": BACKEND_URL})
 
 
 @app.route("/backend_status")
 def backend_status():
     available = _backend_available()
     cuda = False
+    backend_type = "cpu"
     if available:
         try:
             r = http_requests.get(f"{BACKEND_URL}/", timeout=2)
             data = r.json()
             cuda = data.get("cuda", False)
+            backend_type = "gpu" if cuda else "cpu"
         except Exception:
             pass
-    return jsonify({"available": available, "url": BACKEND_URL, "cuda": cuda})
+    return jsonify({
+        "available": available,
+        "url": BACKEND_URL,
+        "cuda": cuda,
+        "type": backend_type,
+        "gpu_url": GPU_BACKEND_URL,
+        "cpu_url": CPU_BACKEND_URL,
+    })
 
 
 if __name__ == "__main__":

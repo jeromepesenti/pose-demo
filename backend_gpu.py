@@ -19,7 +19,13 @@ from mediapipe.tasks.python.vision import (
     FaceDetector, FaceDetectorOptions,
 )
 from rtmlib import Body, Wholebody
-from ultralytics import YOLO
+
+_HAS_YOLO = False
+try:
+    from ultralytics import YOLO
+    _HAS_YOLO = True
+except ImportError:
+    pass
 
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -100,7 +106,7 @@ def _create_processor(mode):
         return Body(mode='lightweight', to_openpose=True, backend='onnxruntime')
     elif mode == "rtmpose_whole":
         return Wholebody(mode='lightweight', to_openpose=False, backend='onnxruntime')
-    elif mode == "yolo_shadow":
+    elif mode == "yolo_shadow" and _HAS_YOLO:
         return YOLO("yolov8n-seg.pt")
 
 
@@ -136,8 +142,9 @@ def modes():
     available = [
         "pose", "shadow", "face_mesh", "hands", "face_detect", "objects",
         "rtmpose_body", "rtmpose_whole", "rtmpose_shadow", "rtmpose_costume",
-        "yolo_shadow",
     ]
+    if _HAS_YOLO:
+        available.append("yolo_shadow")
     if _HAS_D2:
         available.extend(["d2_keypoint", "d2_panoptic", "d2_densepose"])
     if _HAS_CUDA:
@@ -407,6 +414,34 @@ def _watchdog():
             print(f"[Watchdog] Idle {int(idle)}s / {IDLE_TIMEOUT}s — auto-shutdown in {remaining}s")
 
 
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "")
+
+
+def _register_with_frontend():
+    """Announce this backend to the frontend server."""
+    if not FRONTEND_URL:
+        return
+    import socket
+    # Get our external IP
+    my_ip = os.environ.get("BACKEND_IP", "")
+    if not my_ip:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            my_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            my_ip = "localhost"
+    my_url = f"http://{my_ip}:5005"
+    try:
+        import requests as _req
+        r = _req.post(f"{FRONTEND_URL}/register_backend",
+                      json={"url": my_url}, timeout=5)
+        print(f"[Register] Registered with frontend at {FRONTEND_URL}: {r.json()}")
+    except Exception as e:
+        print(f"[Register] Failed to register with {FRONTEND_URL}: {e}")
+
+
 if __name__ == "__main__":
     print("=== GPU Backend ===")
     print(f"CUDA: {_HAS_CUDA}")
@@ -414,8 +449,14 @@ if __name__ == "__main__":
     print(f"Idle timeout: {IDLE_TIMEOUT}s")
     if LAMBDA_API_KEY:
         print(f"Self-termination: enabled (instance: {INSTANCE_ID or 'will use process exit'})")
+    if FRONTEND_URL:
+        print(f"Frontend: {FRONTEND_URL}")
 
     # Start watchdog
     threading.Thread(target=_watchdog, daemon=True).start()
+
+    # Register with frontend after a brief delay (let Flask start first)
+    if FRONTEND_URL:
+        threading.Timer(3.0, _register_with_frontend).start()
 
     app.run(host="0.0.0.0", port=5005, threaded=True)
