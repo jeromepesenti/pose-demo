@@ -50,6 +50,28 @@ echo "[5/5] ML models..."
 python3 -c "from ultralytics import YOLO; YOLO('yolov8n-seg.pt')" 2>/dev/null
 python3 -c "from rtmlib import Body; Body(mode='lightweight', to_openpose=True, backend='onnxruntime')" 2>/dev/null
 
+# Detectron2 (optional, adds ~1-2 min)
+if [ "${INSTALL_DETECTRON2:-1}" = "1" ]; then
+    echo "[6/6] Installing Detectron2 + DensePose via conda..."
+    if ! command -v conda &>/dev/null; then
+        echo "  Installing Miniconda..."
+        curl -sL -o /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+        bash /tmp/miniconda.sh -b -p $HOME/miniconda 2>/dev/null
+        export PATH=$HOME/miniconda/bin:$PATH
+    fi
+    conda install -y -c conda-forge detectron2 2>/dev/null || {
+        echo "  Conda install failed, trying pip with pre-built..."
+        pip install --quiet --no-build-isolation 'git+https://github.com/facebookresearch/detectron2.git' 2>/dev/null
+    }
+    # DensePose
+    if [ -d /tmp/detectron2 ]; then
+        pip install --quiet --no-build-isolation -e /tmp/detectron2/projects/DensePose 2>/dev/null
+    else
+        git clone --quiet https://github.com/facebookresearch/detectron2.git /tmp/detectron2 2>/dev/null
+        pip install --quiet --no-build-isolation -e /tmp/detectron2/projects/DensePose 2>/dev/null
+    fi
+fi
+
 ELAPSED=$(($(date +%s) - START))
 echo ""
 echo "=== Done in ${ELAPSED}s ==="
