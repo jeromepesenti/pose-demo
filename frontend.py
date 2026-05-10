@@ -341,4 +341,5 @@ if __name__ == "__main__":
     print(f"=== Frontend Server ===")
     print(f"Backend URL: {BACKEND_URL}")
     print(f"Backend available: {_backend_available()}")
-    app.run(host="0.0.0.0", port=5001, threaded=True)
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="0.0.0.0", port=port, threaded=True)
