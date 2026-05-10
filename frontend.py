@@ -2,9 +2,7 @@
 Runs on a cheap always-on instance (Cloud Run, e2-micro, etc.)
 """
 import os
-import subprocess
 import time
-import shutil
 import json as _json
 import uuid as _uuid
 from flask import Flask, Response, render_template_string, request, jsonify
@@ -21,7 +19,6 @@ VIDEOS_DIR = os.path.join(BASE_DIR, "saved_videos")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 
-YT_DLP = shutil.which("yt-dlp") or os.path.join(BASE_DIR, "venv", "bin", "yt-dlp")
 
 # Backend URLs
 CPU_BACKEND_URL = "http://localhost:5005"  # always-on local CPU backend
@@ -152,44 +149,6 @@ def modes():
 
 
 # ── Video management ─────────────────────────────────────────────────
-
-@app.route("/download", methods=["POST"])
-def download():
-    data = request.json
-    url = data.get("url", "")
-    if not url:
-        return jsonify({"error": "No URL provided"})
-    video_id = str(_uuid.uuid4())[:8]
-    out_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
-    try:
-        title_result = subprocess.run(
-            [YT_DLP, "--print", "title", "--skip-download", "--no-playlist", url],
-            capture_output=True, text=True, timeout=30
-        )
-        name = title_result.stdout.strip() or "YouTube video"
-        subprocess.run(
-            [YT_DLP, "-f", "best[height<=720][ext=mp4]/best[height<=720]/best",
-             "--no-playlist", "-o", out_path, "--force-overwrites", url],
-            check=True, capture_output=True, text=True, timeout=120
-        )
-        current_video["path"] = out_path
-        cap = cv2.VideoCapture(out_path)
-        current_video["fps"] = cap.get(cv2.CAP_PROP_FPS) or 30
-        current_video["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        current_video["duration"] = current_video["total_frames"] / current_video["fps"]
-        cap.release()
-        _add_to_video_index(video_id, name)
-        return jsonify({
-            "ok": True,
-            "duration": current_video["duration"],
-            "fps": current_video["fps"],
-            "total_frames": current_video["total_frames"],
-        })
-    except subprocess.CalledProcessError as e:
-        return jsonify({"error": e.stderr[:500]})
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
 
 @app.route("/upload_video", methods=["POST"])
 def upload_video():

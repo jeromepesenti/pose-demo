@@ -129,8 +129,8 @@
 
   <!-- Main content -->
   <div id="main">
-    <h1>YouTube Vision Demo</h1>
-    <div id="info">Pick an example video or paste a YouTube URL</div>
+    <h1>Vision Demo</h1>
+    <div id="info">Pick a video or upload one</div>
     <div id="backend-status" style="font-size:0.75rem;margin-bottom:8px;display:flex;align-items:center;gap:8px;">
       <span id="backend-info"></span>
       <button id="backend-toggle" onclick="toggleBackendInput()" style="padding:2px 8px;font-size:0.7rem;background:#333;border:1px solid #555;color:#aaa;border-radius:4px;cursor:pointer;">change</button>
@@ -141,11 +141,8 @@
     </div>
 
     <div class="row">
-      <input id="url-input" type="text" placeholder="Paste YouTube URL here...">
-      <button id="go-btn" onclick="go()">Go</button>
-      <span style="color:#555;">or</span>
       <label style="cursor:pointer;">
-        <button onclick="document.getElementById('vid-upload').click(); return false;">Upload</button>
+        <button onclick="document.getElementById('vid-upload').click(); return false;">Upload Video</button>
         <input id="vid-upload" type="file" accept="video/*" style="display:none;" onchange="uploadVideo(this)">
       </label>
     </div>
@@ -352,37 +349,6 @@ async function uploadVideo(input) {
     statusEl.textContent = 'Upload failed: ' + e.message;
   }
   input.value = '';
-}
-
-// ── YouTube download ──
-async function go() {
-  const url = document.getElementById('url-input').value.trim();
-  if (!url) return;
-  const btn = document.getElementById('go-btn');
-  btn.disabled = true;
-  stop();
-  output.style.display = 'none';
-  statusEl.textContent = 'Downloading video...';
-
-  try {
-    const resp = await fetch('/download', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url})
-    });
-    const data = await resp.json();
-    if (data.error) { statusEl.textContent = 'Error: ' + data.error; btn.disabled = false; return; }
-    statusEl.textContent = 'Syncing to backend...';
-    await fetch('/sync_video', { method: 'POST' });
-    videoReady = true;
-    output.style.display = 'block';
-    getMode();
-    loadVideoList();
-    startStream();
-  } catch (e) {
-    statusEl.textContent = 'Error: ' + e.message;
-  }
-  btn.disabled = false;
 }
 
 // ── Streaming ──
