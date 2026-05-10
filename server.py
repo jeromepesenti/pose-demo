@@ -42,6 +42,59 @@ current_video = {"path": None, "fps": 30, "duration": 0, "total_frames": 0}
 import shutil
 YT_DLP = shutil.which("yt-dlp") or os.path.join(BASE_DIR, "venv", "bin", "yt-dlp")
 
+import json as _json
+import uuid as _uuid
+
+VIDEOS_DIR = os.path.join(BASE_DIR, "saved_videos")
+VIDEOS_INDEX = os.path.join(VIDEOS_DIR, "index.json")
+os.makedirs(VIDEOS_DIR, exist_ok=True)
+MAX_SAVED_VIDEOS = 10
+
+def _load_video_index():
+    if os.path.exists(VIDEOS_INDEX):
+        with open(VIDEOS_INDEX) as f:
+            return _json.load(f)
+    return []
+
+def _save_video_index(index):
+    with open(VIDEOS_INDEX, "w") as f:
+        _json.dump(index, f)
+
+def _add_to_video_index(video_id, name):
+    video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
+    index = _load_video_index()
+    index = [v for v in index if v["id"] != video_id]
+    thumb_path = os.path.join(VIDEOS_DIR, f"{video_id}_thumb.jpg")
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(1, total // 10))
+    ret, frame = cap.read()
+    cap.release()
+    if ret:
+        thumb = cv2.resize(frame, (320, 180))
+        cv2.imwrite(thumb_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    index.insert(0, {"id": video_id, "name": name})
+    while len(index) > MAX_SAVED_VIDEOS:
+        old = index.pop()
+        for ext in [".mp4", "_thumb.jpg"]:
+            p = os.path.join(VIDEOS_DIR, f"{old['id']}{ext}")
+            if os.path.exists(p):
+                os.remove(p)
+    _save_video_index(index)
+
+def _load_saved_video(video_id):
+    video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
+    if not os.path.exists(video_path):
+        return None
+    current_video["path"] = video_path
+    cap = cv2.VideoCapture(video_path)
+    current_video["fps"] = cap.get(cv2.CAP_PROP_FPS) or 30
+    current_video["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    current_video["duration"] = current_video["total_frames"] / current_video["fps"]
+    cap.release()
+    return current_video
+
+
 # Processor cache: keep one processor per mode alive to avoid reload cost
 _processor_cache = {}
 _processor_lock = threading.Lock()
@@ -267,24 +320,12 @@ HTML = """
 
 <div id="layout">
 
-  <!-- Sidebar with example videos -->
+  <!-- Sidebar with saved videos -->
   <div id="sidebar">
-    <h2>Example Videos</h2>
-    <div class="video-card" onclick="pickVideo('https://www.youtube.com/watch?v=aqz7rZ3Ys4E', this)">
-      <img src="https://i.ytimg.com/vi/aqz7rZ3Ys4E/mqdefault.jpg" alt="Dance Moves">
-      <div class="card-title">Best of Favorite Dance Moves (2024)</div>
-    </div>
-    <div class="video-card" onclick="pickVideo('https://www.youtube.com/watch?v=iUkX7y_0dsQ', this)">
-      <img src="https://i.ytimg.com/vi/iUkX7y_0dsQ/mqdefault.jpg" alt="Female Dancer">
-      <div class="card-title">Female Dancer White Background</div>
-    </div>
-    <div class="video-card" onclick="pickVideo('https://www.youtube.com/watch?v=r2jd613Rdhs', this)">
-      <img src="https://i.ytimg.com/vi/r2jd613Rdhs/mqdefault.jpg" alt="iDancers">
-      <div class="card-title">iDancers - Beautiful Girls Dancing</div>
-    </div>
-    <div class="video-card" onclick="pickVideo('https://www.youtube.com/watch?v=2DiQUX11YaY', this)">
-      <img src="https://i.ytimg.com/vi/2DiQUX11YaY/mqdefault.jpg" alt="Flashmob">
-      <div class="card-title">Crazy Uptown Funk Flashmob in Sydney</div>
+    <h2>Recent Videos</h2>
+    <div id="video-list"></div>
+    <div id="no-videos" style="color:#555; font-size:0.8rem; padding:8px;">
+      Upload a video to get started
     </div>
   </div>
 
@@ -404,6 +445,65 @@ fetch('/modes').then(r => r.json()).then(modes => {
   }
 });
 
+// Load saved videos into sidebar
+function loadVideoList() {
+  fetch('/videos').then(r => r.json()).then(videos => {
+    const list = document.getElementById('video-list');
+    const noVids = document.getElementById('no-videos');
+    list.innerHTML = '';
+    if (videos.length === 0) {
+      noVids.style.display = 'block';
+      return;
+    }
+    noVids.style.display = 'none';
+    videos.forEach(v => {
+      const card = document.createElement('div');
+      card.className = 'video-card';
+      card.dataset.videoId = v.id;
+      card.onclick = () => pickSavedVideo(v.id, card);
+      card.innerHTML = '<img src="/thumbnail/' + v.id + '" alt="' + v.name + '">'
+        + '<div class="card-title">' + v.name + '</div>';
+      list.appendChild(card);
+    });
+  });
+}
+
+async function pickSavedVideo(videoId, card) {
+  document.querySelectorAll('.video-card').forEach(c => c.classList.remove('active'));
+  if (card) card.classList.add('active');
+  const btn = document.getElementById('go-btn');
+  btn.disabled = true;
+  stop();
+  output.style.display = 'none';
+  statusEl.textContent = 'Loading video...';
+
+  try {
+    const resp = await fetch('/load_video/' + videoId);
+    const data = await resp.json();
+    if (data.error) {
+      statusEl.textContent = 'Error: ' + data.error;
+      btn.disabled = false;
+      return;
+    }
+    currentUrl = '__saved_' + videoId;
+    duration = data.duration;
+    fps = data.fps;
+    currentTime = 0;
+    slider.value = 0;
+    updateTimeDisplay();
+    output.style.display = 'block';
+    getMode();
+    statusEl.textContent = 'Ready — press play';
+    btn.disabled = false;
+    fetchFrame(0);
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+  }
+}
+
+loadVideoList();
+
 async function uploadRef(input) {
   if (!input.files[0]) return;
   const formData = new FormData();
@@ -462,6 +562,7 @@ async function uploadVideo(input) {
     statusEl.textContent = 'Ready — press play';
     btn.disabled = false;
     fetchFrame(0);
+    loadVideoList();
   } catch (e) {
     statusEl.textContent = 'Upload failed: ' + e.message;
     btn.disabled = false;
@@ -501,6 +602,7 @@ async function go() {
       currentUrl = url;
       duration = data.duration;
       fps = data.fps;
+      loadVideoList();
     } catch (e) {
       statusEl.textContent = 'Error: ' + e.message;
       btn.disabled = false;
@@ -676,8 +778,16 @@ def modes():
 # ── Video download ───────────────────────────────────────────────────
 
 def download_video(url):
-    out_path = os.path.join(DOWNLOAD_DIR, "video.mp4")
+    video_id = str(_uuid.uuid4())[:8]
+    out_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
     try:
+        # Get title
+        title_result = subprocess.run(
+            [YT_DLP, "--print", "title", "--skip-download", "--no-playlist", url],
+            capture_output=True, text=True, timeout=30
+        )
+        name = title_result.stdout.strip() or "YouTube video"
+
         subprocess.run(
             [YT_DLP, "-f", "best[height<=720][ext=mp4]/best[height<=720]/best",
              "--no-playlist", "-o", out_path, "--force-overwrites", url],
@@ -689,6 +799,7 @@ def download_video(url):
         current_video["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         current_video["duration"] = current_video["total_frames"] / current_video["fps"]
         cap.release()
+        _add_to_video_index(video_id, name)
         return None
     except subprocess.CalledProcessError as e:
         return e.stderr[:500]
@@ -723,7 +834,9 @@ def upload_video():
     if 'video' not in request.files:
         return jsonify({"error": "No video uploaded"})
     f = request.files['video']
-    out_path = os.path.join(DOWNLOAD_DIR, "video.mp4")
+    video_id = str(_uuid.uuid4())[:8]
+    name = os.path.splitext(f.filename)[0] if f.filename else "Uploaded video"
+    out_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
     f.save(out_path)
     current_video["path"] = out_path
     cap = cv2.VideoCapture(out_path)
@@ -731,6 +844,34 @@ def upload_video():
     current_video["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     current_video["duration"] = current_video["total_frames"] / current_video["fps"]
     cap.release()
+    _add_to_video_index(video_id, name)
+    return jsonify({
+        "ok": True,
+        "duration": current_video["duration"],
+        "fps": current_video["fps"],
+        "total_frames": current_video["total_frames"],
+    })
+
+
+@app.route("/videos")
+def list_videos():
+    return jsonify(_load_video_index())
+
+
+@app.route("/thumbnail/<video_id>")
+def thumbnail(video_id):
+    thumb_path = os.path.join(VIDEOS_DIR, f"{video_id}_thumb.jpg")
+    if not os.path.exists(thumb_path):
+        return "Not found", 404
+    with open(thumb_path, "rb") as f:
+        return Response(f.read(), mimetype="image/jpeg")
+
+
+@app.route("/load_video/<video_id>")
+def load_video(video_id):
+    result = _load_saved_video(video_id)
+    if result is None:
+        return jsonify({"error": "Video not found"})
     return jsonify({
         "ok": True,
         "duration": current_video["duration"],
