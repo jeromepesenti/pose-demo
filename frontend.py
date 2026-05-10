@@ -234,6 +234,7 @@ def load_video(video_id):
     result = _load_saved_video(video_id)
     if result is None:
         return jsonify({"error": "Video not found"})
+    _backend_video_synced["path"] = None  # force re-sync
     return jsonify({
         "ok": True,
         "duration": current_video["duration"],
@@ -242,126 +243,105 @@ def load_video(video_id):
     })
 
 
-# ── Frame processing (proxy to GPU backend) ──────────────────────────
+# ── Sync video to backend ─────────────────────────────────────────────
+
+_backend_video_synced = {"path": None}  # track which video the backend has
+
+
+def _sync_video_to_backend():
+    """Upload current video to the GPU backend if not already synced."""
+    path = current_video.get("path")
+    if not path or not os.path.exists(path):
+        return False
+    if _backend_video_synced["path"] == path:
+        return True  # already synced
+
+    try:
+        with open(path, "rb") as f:
+            r = http_requests.post(
+                f"{BACKEND_URL}/upload_video",
+                files={"video": ("video.mp4", f, "video/mp4")},
+                timeout=120)
+        if r.status_code == 200 and r.json().get("ok"):
+            _backend_video_synced["path"] = path
+            print(f"[Sync] Video synced to backend")
+            return True
+    except Exception as e:
+        print(f"[Sync] Failed to sync video: {e}")
+    return False
+
+
+# ── Frame processing (proxy to backend which has the video) ──────────
 
 @app.route("/frame/<mode>")
 def frame(mode):
-    path = current_video.get("path")
-    if not path or not os.path.exists(path):
+    if not current_video.get("path"):
         return "No video loaded", 404
 
-    t = float(request.args.get("t", 0))
-    prompt = request.args.get("prompt", "")
-    fps = current_video["fps"]
+    # Ensure backend has the video
+    if _backend_available() and _sync_video_to_backend():
+        # Proxy to backend — it reads the frame itself, no per-frame transfer
+        try:
+            backend_url = f"{BACKEND_URL}/frame/{mode}?{request.query_string.decode()}"
+            r = http_requests.get(backend_url, timeout=30)
+            return Response(r.content, mimetype="image/jpeg",
+                            headers={
+                                "Cache-Control": "no-store",
+                                "X-Process-Ms": r.headers.get("X-Process-Ms", "?"),
+                                "Access-Control-Expose-Headers": "X-Process-Ms",
+                            })
+        except Exception as e:
+            print(f"[Frame] Backend error: {e}, falling back to CPU")
 
-    # Read the frame locally
-    cap = cv2.VideoCapture(path)
-    frame_num = int(t * fps)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-    ret, raw_frame = cap.read()
-    cap.release()
-
-    if not ret:
-        return "Frame not found", 404
-
-    # Encode frame and send to GPU backend
-    _, buf = cv2.imencode(".jpg", raw_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-
+    # Fallback: process locally on CPU backend
     try:
-        backend_url = f"{BACKEND_URL}/process?mode={mode}"
-        if prompt:
-            backend_url += f"&prompt={prompt}"
-        r = http_requests.post(backend_url, data=buf.tobytes(),
-                               headers={"Content-Type": "image/jpeg"}, timeout=30)
-        proc_ms = r.headers.get("X-Process-Ms", "?")
+        backend_url = f"{CPU_BACKEND_URL}/frame/{mode}?{request.query_string.decode()}"
+        r = http_requests.get(backend_url, timeout=30)
         return Response(r.content, mimetype="image/jpeg",
                         headers={
                             "Cache-Control": "no-store",
-                            "X-Process-Ms": proc_ms,
+                            "X-Process-Ms": r.headers.get("X-Process-Ms", "?"),
                             "Access-Control-Expose-Headers": "X-Process-Ms",
                         })
-    except Exception as e:
-        # Backend unavailable — return raw frame
-        return Response(buf.tobytes(), mimetype="image/jpeg",
-                        headers={"X-Process-Ms": "-1"})
+    except Exception:
+        return "Backend unavailable", 503
 
 
-# ── MJPEG streaming (proxy to GPU backend) ───────────────────────────
-
-_stream_stats = {"proc_ms": 0, "frame_num": 0, "fps": 0, "t0": 0, "count": 0}
-
+# ── MJPEG streaming (proxy to backend) ───────────────────────────────
 
 @app.route("/stream_stats")
 def stream_stats():
-    return jsonify(_stream_stats)
-
-
-def _generate_stream(mode, start_time=0, prompt=None):
-    path = current_video.get("path")
-    if not path or not os.path.exists(path):
-        return
-
-    cap = cv2.VideoCapture(path)
-    vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    frame_delay = 1.0 / vid_fps
-
-    if start_time > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_time * vid_fps))
-
-    frame_num = int(start_time * vid_fps)
-    backend_url = f"{BACKEND_URL}/process?mode={mode}"
-    if prompt:
-        backend_url += f"&prompt={prompt}"
-
+    # Proxy to whichever backend is active
     try:
-        while cap.isOpened():
-            t0 = time.time()
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            try:
-                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                r = http_requests.post(backend_url, data=buf.tobytes(),
-                                       headers={"Content-Type": "image/jpeg"}, timeout=30)
-                proc_ms = int(r.headers.get("X-Process-Ms", 0))
-
-                # Update stats
-                _stream_stats["proc_ms"] = proc_ms
-                _stream_stats["frame_num"] = frame_num
-                _stream_stats["count"] += 1
-                now = time.time()
-                if _stream_stats["t0"] == 0:
-                    _stream_stats["t0"] = now
-                elif now - _stream_stats["t0"] >= 1.0:
-                    _stream_stats["fps"] = round(_stream_stats["count"] / (now - _stream_stats["t0"]), 1)
-                    _stream_stats["count"] = 0
-                    _stream_stats["t0"] = now
-
-                yield (b"--frame\r\n"
-                       b"Content-Type: image/jpeg\r\n\r\n"
-                       + r.content + b"\r\n")
-
-                elapsed = time.time() - t0
-                if elapsed < frame_delay:
-                    time.sleep(frame_delay - elapsed)
-            except Exception as e:
-                print(f"[stream] Error: {e}")
-                continue
-            finally:
-                frame_num += 1
-    finally:
-        cap.release()
+        r = http_requests.get(f"{BACKEND_URL}/stream_stats", timeout=2)
+        return Response(r.content, mimetype="application/json")
+    except Exception:
+        return jsonify({"proc_ms": 0, "fps": 0})
 
 
 @app.route("/stream/<mode>")
 def stream(mode):
-    start_time = float(request.args.get("t", 0))
-    prompt = request.args.get("prompt", None)
-    return Response(
-        _generate_stream(mode, start_time=start_time, prompt=prompt),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
+    if not current_video.get("path"):
+        return "No video loaded", 404
+
+    # Ensure backend has the video
+    backend = BACKEND_URL
+    if _backend_available():
+        _sync_video_to_backend()
+    else:
+        backend = CPU_BACKEND_URL
+
+    # Proxy the MJPEG stream from backend
+    try:
+        backend_url = f"{backend}/stream/{mode}?{request.query_string.decode()}"
+        r = http_requests.get(backend_url, stream=True, timeout=300)
+        return Response(
+            r.iter_content(chunk_size=8192),
+            mimetype="multipart/x-mixed-replace; boundary=frame",
+        )
+    except Exception as e:
+        print(f"[Stream] Error: {e}")
+        return "Stream unavailable", 503
 
 
 # ── Backend status ───────────────────────────────────────────────────

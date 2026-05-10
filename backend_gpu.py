@@ -28,7 +28,12 @@ except ImportError:
     pass
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VIDEOS_DIR = os.path.join(BASE_DIR, "videos")
+os.makedirs(VIDEOS_DIR, exist_ok=True)
+
+_current_video = {"path": None, "fps": 30, "duration": 0, "total_frames": 0}
 
 # Check for CUDA
 _HAS_CUDA = False
@@ -150,6 +155,178 @@ def modes():
     if _HAS_CUDA:
         available.extend(["controlnet", "controlnet_video"])
     return jsonify(available)
+
+
+# ── Video management on backend ──────────────────────────────────────
+
+@app.route("/upload_video", methods=["POST"])
+def upload_video():
+    if 'video' not in request.files:
+        return jsonify({"error": "No video uploaded"})
+    f = request.files['video']
+    out_path = os.path.join(VIDEOS_DIR, "current.mp4")
+    f.save(out_path)
+    _current_video["path"] = out_path
+    cap = cv2.VideoCapture(out_path)
+    _current_video["fps"] = cap.get(cv2.CAP_PROP_FPS) or 30
+    _current_video["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    _current_video["duration"] = _current_video["total_frames"] / _current_video["fps"]
+    cap.release()
+    return jsonify({
+        "ok": True,
+        "duration": _current_video["duration"],
+        "fps": _current_video["fps"],
+    })
+
+
+@app.route("/video_status")
+def video_status():
+    return jsonify({
+        "has_video": _current_video["path"] is not None,
+        "fps": _current_video["fps"],
+        "duration": _current_video["duration"],
+    })
+
+
+@app.route("/frame/<mode>")
+def frame_endpoint(mode):
+    """Process a single frame from the loaded video."""
+    path = _current_video.get("path")
+    if not path or not os.path.exists(path):
+        return "No video loaded on backend", 404
+
+    t = float(request.args.get("t", 0))
+    prompt = request.args.get("prompt", "person dancing, professional photo")
+    fps = _current_video["fps"]
+
+    cap = cv2.VideoCapture(path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(t * fps))
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret:
+        return "Frame not found", 404
+
+    t0 = time.time()
+    try:
+        if mode == "controlnet" and _HAS_CUDA:
+            out = controlnet_generate(frame, prompt=prompt)
+        elif mode.startswith("d2_") and _HAS_D2:
+            if mode == "d2_keypoint": out = process_keypoint(frame)
+            elif mode == "d2_panoptic": out = process_panoptic(frame)
+            elif mode == "d2_densepose": out = process_densepose(frame)
+            else: out = frame
+        else:
+            processor = get_processor(mode)
+            is_rtm = mode.startswith("rtmpose")
+            is_yolo = mode.startswith("yolo")
+            if is_rtm or is_yolo:
+                out = _process_frame_simple(mode, processor, frame)
+            else:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                out = _process_frame_mp(mode, processor, frame, mp_image)
+
+        proc_ms = int((time.time() - t0) * 1000)
+        _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return Response(buf.tobytes(), mimetype="image/jpeg",
+                        headers={"X-Process-Ms": str(proc_ms),
+                                 "Access-Control-Expose-Headers": "X-Process-Ms",
+                                 "Cache-Control": "no-store"})
+    except Exception as e:
+        print(f"[{mode}] Frame error: {e}")
+        traceback.print_exc()
+        _, buf = cv2.imencode(".jpg", frame)
+        return Response(buf.tobytes(), mimetype="image/jpeg")
+
+
+_stream_stats = {"proc_ms": 0, "fps": 0, "t0": 0, "count": 0}
+
+
+@app.route("/stream_stats")
+def stream_stats_endpoint():
+    return jsonify(_stream_stats)
+
+
+@app.route("/stream/<mode>")
+def stream_endpoint(mode):
+    """MJPEG stream from loaded video."""
+    start_time = float(request.args.get("t", 0))
+    prompt = request.args.get("prompt", None)
+    return Response(
+        _generate_stream(mode, start_time, prompt),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+def _generate_stream(mode, start_time=0, prompt=None):
+    path = _current_video.get("path")
+    if not path or not os.path.exists(path):
+        return
+
+    cap = cv2.VideoCapture(path)
+    vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    frame_delay = 1.0 / vid_fps
+
+    if start_time > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_time * vid_fps))
+
+    is_rtm = mode.startswith("rtmpose")
+    is_yolo = mode.startswith("yolo")
+    is_d2 = mode.startswith("d2_")
+
+    if not (mode == "controlnet" and _HAS_CUDA):
+        processor = get_processor(mode)
+    else:
+        processor = None
+
+    try:
+        while cap.isOpened():
+            t0 = time.time()
+            ret, frame = cap.read()
+            if not ret:
+                break
+            try:
+                if mode == "controlnet" and _HAS_CUDA:
+                    out = controlnet_generate(frame, prompt=prompt or "person dancing")
+                elif mode.startswith("d2_") and _HAS_D2:
+                    if mode == "d2_keypoint": out = process_keypoint(frame)
+                    elif mode == "d2_panoptic": out = process_panoptic(frame)
+                    elif mode == "d2_densepose": out = process_densepose(frame)
+                    else: out = frame
+                elif is_rtm or is_yolo:
+                    out = _process_frame_simple(mode, processor, frame)
+                else:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                    out = _process_frame_mp(mode, processor, frame, mp_image)
+
+                proc_ms = int((time.time() - t0) * 1000)
+                _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 80])
+
+                _stream_stats["proc_ms"] = proc_ms
+                _stream_stats["count"] += 1
+                now = time.time()
+                if _stream_stats["t0"] == 0:
+                    _stream_stats["t0"] = now
+                elif now - _stream_stats["t0"] >= 1.0:
+                    _stream_stats["fps"] = round(_stream_stats["count"] / (now - _stream_stats["t0"]), 1)
+                    _stream_stats["count"] = 0
+                    _stream_stats["t0"] = now
+
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n"
+                       + buf.tobytes() + b"\r\n")
+
+                elapsed = time.time() - t0
+                if elapsed < frame_delay:
+                    time.sleep(frame_delay - elapsed)
+            except Exception as e:
+                print(f"[{mode}] Stream error: {e}")
+                traceback.print_exc()
+                continue
+    finally:
+        cap.release()
 
 
 # ── Process a single frame ───────────────────────────────────────────
