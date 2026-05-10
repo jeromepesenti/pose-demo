@@ -124,7 +124,7 @@ def _lambda_launch():
         for attempt in range(24):
             try:
                 r = subprocess.run(
-                    ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519"), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                    ["ssh", "-i", os.path.expanduser("~/.ssh/lambda_key"), "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
                      f"ubuntu@{ip}", "echo ready"],
                     capture_output=True, timeout=10, text=True)
                 if r.returncode == 0:
@@ -146,14 +146,14 @@ def _lambda_launch():
             f"{base}/setup_lambda.sh"
         ] if os.path.exists(f)]
         subprocess.run(
-            ["scp", "-i", os.path.expanduser("~/.ssh/id_ed25519"), "-o", "StrictHostKeyChecking=no"] + files +
+            ["scp", "-i", os.path.expanduser("~/.ssh/lambda_key"), "-o", "StrictHostKeyChecking=no"] + files +
             [f"ubuntu@{ip}:~/pose-demo/"],
             capture_output=True, timeout=60)
 
         # Run setup
         _lambda_state["message"] = "Installing dependencies (~2 min)..."
         r = subprocess.run(
-            ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519"), "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
+            ["ssh", "-i", os.path.expanduser("~/.ssh/lambda_key"), "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
              "bash ~/pose-demo/setup_lambda.sh"],
             capture_output=True, timeout=600, text=True)
         if r.returncode != 0:
@@ -164,7 +164,7 @@ def _lambda_launch():
         _lambda_state["message"] = "Starting backend server..."
         instance_id = _lambda_state["instance_id"]
         subprocess.run(
-            ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519"), "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
+            ["ssh", "-i", os.path.expanduser("~/.ssh/lambda_key"), "-o", "StrictHostKeyChecking=no", f"ubuntu@{ip}",
              f"cd ~/pose-demo && LAMBDA_API_KEY={LAMBDA_API_KEY} LAMBDA_INSTANCE_ID={instance_id} "
              f"IDLE_TIMEOUT={_lambda_state['idle_timeout']} "
              "nohup python3 backend_gpu.py > backend.log 2>&1 &"],
