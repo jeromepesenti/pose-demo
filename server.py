@@ -714,32 +714,68 @@ function togglePlay() {
   }
 }
 
+let sliderInterval = null;
+let statsInterval = null;
+
 function play() {
   playing = true;
   playBtn.innerHTML = '&#9646;&#9646;';
-  statusEl.textContent = 'Playing — ' + document.getElementById('mode-select').selectedOptions[0].text;
-  let lastTs = performance.now();
+  statusEl.textContent = 'Streaming — ' + document.getElementById('mode-select').selectedOptions[0].text;
 
-  function tick(now) {
+  // Use MJPEG stream for continuous playback (no per-frame round-trip)
+  const mode = getMode();
+  let streamUrl = '/stream/' + mode + '?t=' + currentTime.toFixed(3);
+  if (mode.startsWith('controlnet')) {
+    streamUrl += '&prompt=' + encodeURIComponent(
+      document.getElementById('prompt-input').value.trim());
+  }
+
+  img.src = streamUrl;
+
+  // Update slider based on elapsed time
+  const startTime = currentTime;
+  const startWall = performance.now();
+  sliderInterval = setInterval(() => {
     if (!playing) return;
-    const dt = (now - lastTs) / 1000;
-    lastTs = now;
-    currentTime += dt;
-
+    currentTime = startTime + (performance.now() - startWall) / 1000;
     if (currentTime >= duration) {
       currentTime = duration;
       stop();
       return;
     }
-
-    if (!seeking) {
-      slider.value = Math.round((currentTime / duration) * 1000);
-    }
+    slider.value = Math.round((currentTime / duration) * 1000);
     updateTimeDisplay();
-    fetchFrame(currentTime);
-    rafId = requestAnimationFrame(tick);
-  }
-  rafId = requestAnimationFrame(tick);
+  }, 100);
+
+  // Poll server for live stats during streaming
+  statsInterval = setInterval(() => {
+    if (!playing) return;
+    fetch('/stream_stats').then(r => r.json()).then(s => {
+      const procEl = document.getElementById('stat-proc');
+      procEl.textContent = s.proc_ms + 'ms';
+      procEl.className = 'stat-value ' + (s.proc_ms < 33 ? 'stat-good' : s.proc_ms < 100 ? 'stat-warn' : 'stat-bad');
+
+      document.getElementById('stat-rtt').textContent = 'stream';
+      document.getElementById('stat-rtt').className = 'stat-value stat-good';
+
+      const fpsEl = document.getElementById('stat-fps');
+      fpsEl.textContent = s.fps;
+      fpsEl.className = 'stat-value ' + (s.fps >= 24 ? 'stat-good' : s.fps >= 10 ? 'stat-warn' : 'stat-bad');
+
+      const videoFps = fps || 30;
+      const statusEl2 = document.getElementById('stat-status');
+      if (s.fps >= videoFps * 0.9) {
+        statusEl2.textContent = 'Real-time';
+        statusEl2.className = 'stat-value stat-good';
+      } else if (s.fps >= videoFps * 0.5) {
+        statusEl2.textContent = 'Slight lag';
+        statusEl2.className = 'stat-value stat-warn';
+      } else if (s.fps > 0) {
+        statusEl2.textContent = 'Lagging (' + Math.round(s.fps/videoFps*100) + '%)';
+        statusEl2.className = 'stat-value stat-bad';
+      }
+    }).catch(() => {});
+  }, 500);
 }
 
 function stop() {
@@ -747,7 +783,14 @@ function stop() {
   playBtn.innerHTML = '&#9654;';
   if (rafId) cancelAnimationFrame(rafId);
   rafId = null;
-  if (statusEl.textContent.startsWith('Playing'))
+  if (sliderInterval) { clearInterval(sliderInterval); sliderInterval = null; }
+  if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
+
+  // Switch from MJPEG stream back to single frame
+  if (img.src.includes('/stream/')) {
+    fetchFrame(currentTime);
+  }
+  if (statusEl.textContent.startsWith('Streaming') || statusEl.textContent.startsWith('Playing'))
     statusEl.textContent = 'Paused';
 }
 
@@ -1616,18 +1659,37 @@ def frame(mode):
 
 # ── Legacy MJPEG stream (kept for compatibility) ─────────────────────
 
-def generate_frames(mode):
+_stream_stats = {"proc_ms": 0, "frame_num": 0, "fps": 0, "t0": 0, "count": 0}
+
+
+@app.route("/stream_stats")
+def stream_stats():
+    return jsonify(_stream_stats)
+
+
+def generate_frames(mode, start_time=0, prompt=None):
     path = current_video.get("path")
     if not path or not os.path.exists(path):
         return
 
     cap = cv2.VideoCapture(path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    delay = 1.0 / fps
+    vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    frame_delay = 1.0 / vid_fps
+
+    if start_time > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_time * vid_fps))
 
     is_rtm = mode.startswith("rtmpose")
-    processor = get_processor(mode)
+    is_yolo = mode.startswith("yolo")
+    is_d2 = mode.startswith("d2_")
+    needs_raw = is_rtm or is_yolo or is_d2
 
+    if mode == "controlnet" and _HAS_CUDA:
+        processor = None
+    else:
+        processor = get_processor(mode)
+
+    frame_num = int(start_time * vid_fps)
     try:
         while cap.isOpened():
             t0 = time.time()
@@ -1635,22 +1697,46 @@ def generate_frames(mode):
             if not ret:
                 break
             try:
-                if is_rtm:
+                if mode == "controlnet" and _HAS_CUDA:
+                    out = controlnet_generate(frame, prompt=prompt or "person dancing, professional photo")
+                elif mode == "controlnet_video" and _HAS_CUDA:
+                    out = frame.copy()
+                elif needs_raw:
                     out = process_frame(mode, processor, frame, None)
                 else:
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                     out = process_frame(mode, processor, frame, mp_image)
+
+                proc_ms = int((time.time() - t0) * 1000)
                 _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 80])
+
+                # Update live stats
+                _stream_stats["proc_ms"] = proc_ms
+                _stream_stats["frame_num"] = frame_num
+                _stream_stats["count"] += 1
+                now = time.time()
+                if _stream_stats["t0"] == 0:
+                    _stream_stats["t0"] = now
+                elif now - _stream_stats["t0"] >= 1.0:
+                    _stream_stats["fps"] = round(_stream_stats["count"] / (now - _stream_stats["t0"]), 1)
+                    _stream_stats["count"] = 0
+                    _stream_stats["t0"] = now
+
                 yield (b"--frame\r\n"
-                       b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+                       b"Content-Type: image/jpeg\r\n\r\n"
+                       + buf.tobytes() + b"\r\n")
+
+                # Pace to video frame rate
+                elapsed = time.time() - t0
+                if elapsed < frame_delay:
+                    time.sleep(frame_delay - elapsed)
             except Exception as e:
                 print(f"[{mode}] Frame error: {e}")
                 traceback.print_exc()
                 continue
-            elapsed = time.time() - t0
-            if elapsed < delay:
-                time.sleep(delay - elapsed)
+            finally:
+                frame_num += 1
     finally:
         cap.release()
 
@@ -1659,8 +1745,10 @@ def generate_frames(mode):
 def stream(mode):
     if mode not in MODES:
         return "Invalid mode", 400
+    start_time = float(request.args.get("t", 0))
+    prompt = request.args.get("prompt", None)
     return Response(
-        generate_frames(mode),
+        generate_frames(mode, start_time=start_time, prompt=prompt),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
 
